@@ -13,11 +13,30 @@ final class AppViewModel: ObservableObject {
 
     private let pluginRegistry = PluginRegistry()
     private let midiService = MIDIService()
+    private var pluginLogObserver: NSObjectProtocol?
+    private let persistedCellsKey = "AppViewModel.persistedCells.v1"
 
     init() {
         self.availablePlugins = pluginRegistry.plugins.map { PluginDescriptor(id: $0.id, name: $0.name) }
+        loadPersistedCells()
         midiService.onEvent = { [weak self] event in
             self?.handle(event: event)
+        }
+        pluginLogObserver = NotificationCenter.default.addObserver(
+            forName: PluginLog.didEmit,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let line = notification.object as? String else { return }
+            Task { @MainActor [weak self] in
+                self?.appendToLog("[PLUGIN] \(line)")
+            }
+        }
+    }
+
+    deinit {
+        if let observer = pluginLogObserver {
+            NotificationCenter.default.removeObserver(observer)
         }
     }
 
@@ -39,6 +58,10 @@ final class AppViewModel: ObservableObject {
         let pluginName = pluginRegistry.plugin(id: mapping.pluginID)?.name ?? mapping.pluginID
         let targetName = pluginRegistry.targetName(pluginID: mapping.pluginID, targetID: mapping.targetID) ?? mapping.targetID
         return "\(pluginName): \(targetName)"
+    }
+
+    func mappingTargetID(for index: Int) -> String? {
+        cells[safe: index]?.mapping?.targetID
     }
 
     func event(for index: Int) -> MIDIEvent? {
@@ -78,16 +101,31 @@ final class AppViewModel: ObservableObject {
         guard cells.indices.contains(selectedCellIndex) else { return }
         let targetID = pluginRegistry.firstTargetID(pluginID: id) ?? "unassigned"
         cells[selectedCellIndex].mapping = ControlMapping(pluginID: id, targetID: targetID)
+        savePersistedCells()
     }
 
     func setTargetForSelectedCell(id: String) {
         guard cells.indices.contains(selectedCellIndex) else { return }
         let pluginID = cells[selectedCellIndex].mapping?.pluginID ?? defaultPluginID
         cells[selectedCellIndex].mapping = ControlMapping(pluginID: pluginID, targetID: id)
+        savePersistedCells()
     }
 
     func clearMidiLog() {
         midiLog.removeAll()
+    }
+
+    func sendOBSDebugToggle() {
+        let raw = RawMIDIMessage(status: 0x90, data1: 0, data2: 0)
+        let event = MIDIEvent(
+            sourceName: "Internal Debug",
+            sourceID: -1,
+            protocolKind: .raw,
+            kind: .unknown(status: raw.status, data1: raw.data1, data2: raw.data2),
+            rawMessage: raw
+        )
+        appendToLog("[DEBUG] Sending OBS toggle test")
+        pluginRegistry.plugin(id: "obs")?.handle(event: event, targetID: "recording.toggle")
     }
 
     private func handle(event: MIDIEvent) {
@@ -102,7 +140,7 @@ final class AppViewModel: ObservableObject {
                 }
                 cells[index].event = event
                 applyAnimation(to: index, event: event)
-                if let mapping = cells[index].mapping {
+                if !isLearnEnabled, let mapping = cells[index].mapping {
                     pluginRegistry.plugin(id: mapping.pluginID)?.handle(event: event, targetID: mapping.targetID)
                 }
                 if index == selectedCellIndex {
@@ -121,6 +159,11 @@ final class AppViewModel: ObservableObject {
             return
         }
 
+        let previousTrigger = cells[selectedCellIndex].trigger
+        let previousSourceID = cells[selectedCellIndex].triggerSourceID
+        let previousSourceName = cells[selectedCellIndex].triggerSourceName
+        let previousMapping = cells[selectedCellIndex].mapping
+
         cells[selectedCellIndex].trigger = trigger
         cells[selectedCellIndex].triggerSourceID = event.sourceID
         cells[selectedCellIndex].triggerSourceName = event.sourceName
@@ -130,8 +173,15 @@ final class AppViewModel: ObservableObject {
         }
 
         if cells[selectedCellIndex].mapping == nil {
-            let targetID = pluginRegistry.firstTargetID(pluginID: defaultPluginID) ?? "unassigned"
+            let targetID = preferredDefaultTargetID(for: event)
             cells[selectedCellIndex].mapping = ControlMapping(pluginID: defaultPluginID, targetID: targetID)
+        }
+
+        if previousTrigger != cells[selectedCellIndex].trigger
+            || previousSourceID != cells[selectedCellIndex].triggerSourceID
+            || previousSourceName != cells[selectedCellIndex].triggerSourceName
+            || previousMapping != cells[selectedCellIndex].mapping {
+            savePersistedCells()
         }
     }
 
@@ -244,6 +294,165 @@ final class AppViewModel: ObservableObject {
             return true
         }
         return cell.triggerSourceID == nil && cell.triggerSourceName == nil
+    }
+
+    private func preferredDefaultTargetID(for event: MIDIEvent) -> String {
+        if case .mackieTransport(.record) = event.kind {
+            return "recording.toggle"
+        }
+        return pluginRegistry.firstTargetID(pluginID: defaultPluginID) ?? "unassigned"
+    }
+
+    private func loadPersistedCells() {
+        guard
+            let data = UserDefaults.standard.data(forKey: persistedCellsKey),
+            let persisted = try? JSONDecoder().decode([PersistedGridCell].self, from: data)
+        else {
+            return
+        }
+
+        var restored = Array(repeating: GridCellState(), count: 16)
+        for (index, entry) in persisted.prefix(restored.count).enumerated() {
+            restored[index].trigger = entry.trigger?.toRuntime()
+            restored[index].triggerSourceID = entry.triggerSourceID
+            restored[index].triggerSourceName = entry.triggerSourceName
+            restored[index].mapping = entry.mapping
+        }
+        cells = restored
+    }
+
+    private func savePersistedCells() {
+        let persisted = cells.map { cell in
+            PersistedGridCell(
+                trigger: cell.trigger.map(PersistedTrigger.fromRuntime),
+                triggerSourceID: cell.triggerSourceID,
+                triggerSourceName: cell.triggerSourceName,
+                mapping: cell.mapping
+            )
+        }
+
+        guard let data = try? JSONEncoder().encode(persisted) else { return }
+        UserDefaults.standard.set(data, forKey: persistedCellsKey)
+    }
+}
+
+private struct PersistedGridCell: Codable {
+    let trigger: PersistedTrigger?
+    let triggerSourceID: Int32?
+    let triggerSourceName: String?
+    let mapping: ControlMapping?
+}
+
+private struct PersistedTrigger: Codable {
+    let kind: String
+    let channel: Int?
+    let note: Int?
+    let controller: Int?
+    let program: Int?
+    let action: String?
+    let index: Int?
+
+    static func fromRuntime(_ trigger: MIDITrigger) -> PersistedTrigger {
+        switch trigger {
+        case let .note(channel, note):
+            return PersistedTrigger(
+                kind: "note",
+                channel: channel,
+                note: note,
+                controller: nil,
+                program: nil,
+                action: nil,
+                index: nil
+            )
+        case let .controlChange(channel, controller):
+            return PersistedTrigger(
+                kind: "controlChange",
+                channel: channel,
+                note: nil,
+                controller: controller,
+                program: nil,
+                action: nil,
+                index: nil
+            )
+        case let .programChange(channel, program):
+            return PersistedTrigger(
+                kind: "programChange",
+                channel: channel,
+                note: nil,
+                controller: nil,
+                program: program,
+                action: nil,
+                index: nil
+            )
+        case let .pitchBend(channel):
+            return PersistedTrigger(
+                kind: "pitchBend",
+                channel: channel,
+                note: nil,
+                controller: nil,
+                program: nil,
+                action: nil,
+                index: nil
+            )
+        case let .mackieTransport(action):
+            return PersistedTrigger(
+                kind: "mackieTransport",
+                channel: nil,
+                note: nil,
+                controller: nil,
+                program: nil,
+                action: action.rawValue,
+                index: nil
+            )
+        case let .mackieVPot(index):
+            return PersistedTrigger(
+                kind: "mackieVPot",
+                channel: nil,
+                note: nil,
+                controller: nil,
+                program: nil,
+                action: nil,
+                index: index
+            )
+        case let .mackieFader(index):
+            return PersistedTrigger(
+                kind: "mackieFader",
+                channel: nil,
+                note: nil,
+                controller: nil,
+                program: nil,
+                action: nil,
+                index: index
+            )
+        }
+    }
+
+    func toRuntime() -> MIDITrigger? {
+        switch kind {
+        case "note":
+            guard let channel, let note else { return nil }
+            return .note(channel: channel, note: note)
+        case "controlChange":
+            guard let channel, let controller else { return nil }
+            return .controlChange(channel: channel, controller: controller)
+        case "programChange":
+            guard let channel, let program else { return nil }
+            return .programChange(channel: channel, program: program)
+        case "pitchBend":
+            guard let channel else { return nil }
+            return .pitchBend(channel: channel)
+        case "mackieTransport":
+            guard let action, let transportAction = MackieTransportAction(rawValue: action) else { return nil }
+            return .mackieTransport(transportAction)
+        case "mackieVPot":
+            guard let index else { return nil }
+            return .mackieVPot(index: index)
+        case "mackieFader":
+            guard let index else { return nil }
+            return .mackieFader(index: index)
+        default:
+            return nil
+        }
     }
 }
 

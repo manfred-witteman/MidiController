@@ -10,6 +10,10 @@ import Combine
 
 struct ContentView: View {
     @StateObject private var viewModel = AppViewModel()
+    @State private var showOBSSettings = false
+    @State private var obsHost = OBSConnectionSettings.default.host
+    @State private var obsPort = String(OBSConnectionSettings.default.port)
+    @State private var obsPassword = OBSConnectionSettings.default.password
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -17,6 +21,13 @@ struct ContentView: View {
                 Text("MIDI Controller")
                     .font(.title2.weight(.semibold))
                 Spacer()
+                Button("OBS") {
+                    loadOBSSettings()
+                    showOBSSettings = true
+                }
+                Button("OBS Test") {
+                    viewModel.sendOBSDebugToggle()
+                }
                 Toggle("Learn", isOn: $viewModel.isLearnEnabled)
                     .toggleStyle(.switch)
                     .labelsHidden()
@@ -30,6 +41,7 @@ struct ContentView: View {
                     EventCellView(
                         cellState: viewModel.cells[index],
                         mappingTitle: viewModel.mappingTitle(for: index),
+                        mappingTargetID: viewModel.mappingTargetID(for: index),
                         isSelected: index == viewModel.selectedCellIndex,
                         tileColor: tileColor(for: index),
                         isLearnEnabled: viewModel.isLearnEnabled
@@ -74,6 +86,20 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
         }
         .padding()
+        .sheet(isPresented: $showOBSSettings) {
+            OBSSettingsSheet(
+                host: $obsHost,
+                port: $obsPort,
+                password: $obsPassword,
+                onCancel: {
+                    showOBSSettings = false
+                },
+                onSave: {
+                    saveOBSSettings()
+                    showOBSSettings = false
+                }
+            )
+        }
     }
 
     private func tileColor(for index: Int) -> Color {
@@ -97,11 +123,31 @@ struct ContentView: View {
         ]
         return palette[index % palette.count]
     }
+
+    private func loadOBSSettings() {
+        let settings = OBSSettingsStorage.load()
+        obsHost = settings.host
+        obsPort = String(settings.port)
+        obsPassword = settings.password
+    }
+
+    private func saveOBSSettings() {
+        let trimmedHost = obsHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsedPort = Int(obsPort) ?? OBSConnectionSettings.default.port
+        let clampedPort = max(1, min(65535, parsedPort))
+        let settings = OBSConnectionSettings(
+            host: trimmedHost.isEmpty ? OBSConnectionSettings.default.host : trimmedHost,
+            port: clampedPort,
+            password: obsPassword
+        )
+        OBSSettingsStorage.save(settings)
+    }
 }
 
 private struct EventCellView: View {
     let cellState: GridCellState
     let mappingTitle: String
+    let mappingTargetID: String?
     let isSelected: Bool
     let tileColor: Color
     let isLearnEnabled: Bool
@@ -285,10 +331,13 @@ private struct EventCellView: View {
                 .font(.title3.weight(.medium))
                 .foregroundStyle(.primary.opacity(0.9))
                 .lineLimit(1)
-            Text(targetName)
-                .font(.system(size: 20, weight: .regular))
-                .foregroundStyle(.primary.opacity(0.95))
-                .lineLimit(1)
+            HStack(spacing: 8) {
+                targetIcon()
+                Text(targetName)
+                    .font(.system(size: 20, weight: .regular))
+                    .foregroundStyle(.primary.opacity(0.95))
+                    .lineLimit(1)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 14)
@@ -310,6 +359,30 @@ private struct EventCellView: View {
             return (parts[0], parts[1])
         }
         return ("Mapping", value)
+    }
+
+    @ViewBuilder
+    private func targetIcon() -> some View {
+        switch mappingTargetID {
+        case "recording.start":
+            Image(systemName: "record.circle.fill")
+                .font(.title3)
+                .foregroundStyle(.red.opacity(0.9))
+        case "recording.stop":
+            Image(systemName: "stop.circle.fill")
+                .font(.title3)
+                .foregroundStyle(.primary.opacity(0.85))
+        case "recording.toggle":
+            HStack(spacing: 3) {
+                Image(systemName: "record.circle.fill")
+                    .foregroundStyle(.red.opacity(0.9))
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .foregroundStyle(.primary.opacity(0.85))
+            }
+            .font(.caption.weight(.semibold))
+        default:
+            EmptyView()
+        }
     }
 }
 
@@ -389,5 +462,42 @@ private struct MappingEditorView: View {
                 }
             }
         }
+    }
+}
+
+private struct OBSSettingsSheet: View {
+    @Binding var host: String
+    @Binding var port: String
+    @Binding var password: String
+    let onCancel: () -> Void
+    let onSave: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("OBS Verbinding")
+                .font(.headline)
+
+            TextField("Host", text: $host)
+                .textFieldStyle(.roundedBorder)
+
+            TextField("Port", text: $port)
+                .textFieldStyle(.roundedBorder)
+
+            SecureField("Password", text: $password)
+                .textFieldStyle(.roundedBorder)
+
+            HStack {
+                Spacer()
+                Button("Annuleren") {
+                    onCancel()
+                }
+                Button("Opslaan") {
+                    onSave()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 340)
     }
 }
