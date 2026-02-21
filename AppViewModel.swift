@@ -6,7 +6,10 @@ final class AppViewModel: ObservableObject {
     @Published var cells: [GridCellState] = Array(repeating: GridCellState(), count: 16)
     @Published var midiLog: [String] = []
     @Published var selectedCellIndex = 0
-    @Published var isLearnEnabled = true
+    @Published var isLearnEnabled = false
+    @Published var learnPreviewEvent: MIDIEvent?
+    @Published var obsRecordingActive = false
+    @Published var obsInputMuteStates: [String: Bool] = [:]
 
     let defaultPluginID = "obs"
     let availablePlugins: [PluginDescriptor]
@@ -14,10 +17,17 @@ final class AppViewModel: ObservableObject {
     private let pluginRegistry = PluginRegistry()
     private let midiService = MIDIService()
     private var pluginLogObserver: NSObjectProtocol?
+    private var obsTargetsObserver: NSObjectProtocol?
+    private var obsRecordingObserver: NSObjectProtocol?
+    private var obsInputMuteObserver: NSObjectProtocol?
     private let persistedCellsKey = "AppViewModel.persistedCells.v1"
+    private var recentDispatches: [DispatchDebounceKey: Date] = [:]
+    private let instanceID = String(UUID().uuidString.prefix(8))
 
     init() {
+        isLearnEnabled = false
         self.availablePlugins = pluginRegistry.plugins.map { PluginDescriptor(id: $0.id, name: $0.name) }
+        appendToLog("[DEBUG] AppViewModel init id=\(instanceID)")
         loadPersistedCells()
         midiService.onEvent = { [weak self] event in
             self?.handle(event: event)
@@ -32,10 +42,47 @@ final class AppViewModel: ObservableObject {
                 self?.appendToLog("[PLUGIN] \(line)")
             }
         }
+        obsTargetsObserver = NotificationCenter.default.addObserver(
+            forName: OBSTargetCatalog.didChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+        obsRecordingObserver = NotificationCenter.default.addObserver(
+            forName: OBSState.recordingDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let active = notification.object as? Bool else { return }
+            self?.obsRecordingActive = active
+        }
+        obsInputMuteObserver = NotificationCenter.default.addObserver(
+            forName: OBSState.inputMuteDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard
+                let userInfo = notification.userInfo,
+                let inputName = userInfo["inputName"] as? String,
+                let muted = userInfo["muted"] as? Bool
+            else { return }
+            self?.obsInputMuteStates[inputName] = muted
+        }
     }
 
     deinit {
+        print("[DEBUG] AppViewModel deinit id=\(instanceID)")
         if let observer = pluginLogObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = obsTargetsObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = obsRecordingObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = obsInputMuteObserver {
             NotificationCenter.default.removeObserver(observer)
         }
     }
@@ -53,15 +100,28 @@ final class AppViewModel: ObservableObject {
 
     func mappingTitle(for index: Int) -> String {
         guard let mapping = cells[safe: index]?.mapping else {
-            return "Geen mapping"
+            return ""
         }
         let pluginName = pluginRegistry.plugin(id: mapping.pluginID)?.name ?? mapping.pluginID
         let targetName = pluginRegistry.targetName(pluginID: mapping.pluginID, targetID: mapping.targetID) ?? mapping.targetID
         return "\(pluginName): \(targetName)"
     }
 
+    var canRemoveLinkForSelectedCell: Bool {
+        guard let cell = selectedCell else { return false }
+        return cell.trigger != nil || cell.mapping != nil || cell.event != nil
+    }
+
     func mappingTargetID(for index: Int) -> String? {
         cells[safe: index]?.mapping?.targetID
+    }
+
+    func obsMuteState(for targetID: String?) -> Bool? {
+        guard let targetID else { return nil }
+        guard targetID.hasPrefix("input.mute.toggle.") else { return nil }
+        let encoded = String(targetID.dropFirst("input.mute.toggle.".count))
+        guard let inputName = encoded.removingPercentEncoding else { return nil }
+        return obsInputMuteStates[inputName]
     }
 
     func event(for index: Int) -> MIDIEvent? {
@@ -94,11 +154,17 @@ final class AppViewModel: ObservableObject {
 
     func targetGroupsForSelectedCell() -> [PluginTargetGroup] {
         let selectedPluginID = pluginIDForSelectedCell()
-        return pluginRegistry.plugin(id: selectedPluginID)?.targetGroups ?? []
+        return pluginRegistry.targetGroups(pluginID: selectedPluginID)
+    }
+
+    func refreshTargetsForSelectedCell() {
+        let selectedPluginID = pluginIDForSelectedCell()
+        pluginRegistry.refreshTargets(pluginID: selectedPluginID)
     }
 
     func setPluginForSelectedCell(id: String) {
         guard cells.indices.contains(selectedCellIndex) else { return }
+        pluginRegistry.refreshTargets(pluginID: id)
         let targetID = pluginRegistry.firstTargetID(pluginID: id) ?? "unassigned"
         cells[selectedCellIndex].mapping = ControlMapping(pluginID: id, targetID: targetID)
         savePersistedCells()
@@ -111,8 +177,27 @@ final class AppViewModel: ObservableObject {
         savePersistedCells()
     }
 
+    func removeLinkForSelectedCell() {
+        guard cells.indices.contains(selectedCellIndex) else { return }
+        cells[selectedCellIndex].trigger = nil
+        cells[selectedCellIndex].triggerSourceID = nil
+        cells[selectedCellIndex].triggerSourceName = nil
+        cells[selectedCellIndex].mapping = nil
+        cells[selectedCellIndex].event = nil
+        savePersistedCells()
+    }
+
     func clearMidiLog() {
         midiLog.removeAll()
+    }
+
+    func setLearnEnabled(_ enabled: Bool) {
+        if isLearnEnabled == enabled { return }
+        isLearnEnabled = enabled
+        appendToLog("[DEBUG] Learn toggled -> \(enabled ? "ON" : "OFF")")
+        if !enabled {
+            learnPreviewEvent = nil
+        }
     }
 
     func sendOBSDebugToggle() {
@@ -130,8 +215,50 @@ final class AppViewModel: ObservableObject {
 
     private func handle(event: MIDIEvent) {
         appendToLog(event.logLine)
+        appendToLog("[DEBUG] State -> vm=\(instanceID) learn=\(isLearnEnabled) selectedCell=\(selectedCellIndex)")
 
-        var selectedWasMatched = false
+        guard cells.indices.contains(selectedCellIndex) else {
+            return
+        }
+
+        if isLearnEnabled {
+            appendToLog("[DEBUG] Learn input -> selectedCell=\(selectedCellIndex) event=\(event.title)")
+            learnPreviewEvent = event
+            guard let trigger = event.trigger else {
+                appendToLog("[DEBUG] Learn input ignored: no trigger parsed")
+                return
+            }
+
+            let previousTrigger = cells[selectedCellIndex].trigger
+            let previousSourceID = cells[selectedCellIndex].triggerSourceID
+            let previousSourceName = cells[selectedCellIndex].triggerSourceName
+            let previousMapping = cells[selectedCellIndex].mapping
+
+            cells[selectedCellIndex].trigger = trigger
+            cells[selectedCellIndex].triggerSourceID = event.sourceID
+            cells[selectedCellIndex].triggerSourceName = event.sourceName
+            cells[selectedCellIndex].event = event
+            appendToLog("[DEBUG] Learn preview applied -> cell=\(selectedCellIndex) trigger=\(trigger.label)")
+            applyAnimation(to: selectedCellIndex, event: event)
+
+            if cells[selectedCellIndex].mapping == nil {
+                let targetID = preferredDefaultTargetID(for: event)
+                cells[selectedCellIndex].mapping = ControlMapping(pluginID: defaultPluginID, targetID: targetID)
+            }
+
+            if previousTrigger != cells[selectedCellIndex].trigger
+                || previousSourceID != cells[selectedCellIndex].triggerSourceID
+                || previousSourceName != cells[selectedCellIndex].triggerSourceName
+                || previousMapping != cells[selectedCellIndex].mapping {
+                savePersistedCells()
+            }
+            return
+        }
+
+        if learnPreviewEvent != nil {
+            learnPreviewEvent = nil
+        }
+
         if let trigger = event.trigger {
             for index in cells.indices {
                 guard cells[index].trigger == trigger else { continue }
@@ -140,48 +267,12 @@ final class AppViewModel: ObservableObject {
                 }
                 cells[index].event = event
                 applyAnimation(to: index, event: event)
-                if !isLearnEnabled, let mapping = cells[index].mapping {
-                    pluginRegistry.plugin(id: mapping.pluginID)?.handle(event: event, targetID: mapping.targetID)
-                }
-                if index == selectedCellIndex {
-                    selectedWasMatched = true
+                if let mapping = cells[index].mapping {
+                    if shouldDispatch(event: event, forCellAt: index) {
+                        pluginRegistry.plugin(id: mapping.pluginID)?.handle(event: event, targetID: mapping.targetID)
+                    }
                 }
             }
-        }
-
-        guard cells.indices.contains(selectedCellIndex) else {
-            return
-        }
-
-        if !isLearnEnabled { return }
-
-        guard let trigger = event.trigger else {
-            return
-        }
-
-        let previousTrigger = cells[selectedCellIndex].trigger
-        let previousSourceID = cells[selectedCellIndex].triggerSourceID
-        let previousSourceName = cells[selectedCellIndex].triggerSourceName
-        let previousMapping = cells[selectedCellIndex].mapping
-
-        cells[selectedCellIndex].trigger = trigger
-        cells[selectedCellIndex].triggerSourceID = event.sourceID
-        cells[selectedCellIndex].triggerSourceName = event.sourceName
-        cells[selectedCellIndex].event = event
-        if !selectedWasMatched {
-            applyAnimation(to: selectedCellIndex, event: event)
-        }
-
-        if cells[selectedCellIndex].mapping == nil {
-            let targetID = preferredDefaultTargetID(for: event)
-            cells[selectedCellIndex].mapping = ControlMapping(pluginID: defaultPluginID, targetID: targetID)
-        }
-
-        if previousTrigger != cells[selectedCellIndex].trigger
-            || previousSourceID != cells[selectedCellIndex].triggerSourceID
-            || previousSourceName != cells[selectedCellIndex].triggerSourceName
-            || previousMapping != cells[selectedCellIndex].mapping {
-            savePersistedCells()
         }
     }
 
@@ -301,6 +392,34 @@ final class AppViewModel: ObservableObject {
             return "recording.toggle"
         }
         return pluginRegistry.firstTargetID(pluginID: defaultPluginID) ?? "unassigned"
+    }
+
+    private func shouldDispatch(event: MIDIEvent, forCellAt index: Int) -> Bool {
+        guard let trigger = event.trigger else { return true }
+        guard isDiscreteTrigger(event.kind) else { return true }
+
+        let key = DispatchDebounceKey(cellIndex: index, sourceID: event.sourceID, trigger: trigger)
+        let now = event.timestamp
+        if let previous = recentDispatches[key], now.timeIntervalSince(previous) < 0.18 {
+            return false
+        }
+        recentDispatches[key] = now
+
+        // Keep this cache bounded.
+        if recentDispatches.count > 512 {
+            let cutoff = now.addingTimeInterval(-10)
+            recentDispatches = recentDispatches.filter { $0.value > cutoff }
+        }
+        return true
+    }
+
+    private func isDiscreteTrigger(_ kind: MIDIEventKind) -> Bool {
+        switch kind {
+        case .note, .programChange, .mackieTransport:
+            return true
+        case .controlChange, .pitchBend, .mackieVPot, .mackieFader, .unknown:
+            return false
+        }
     }
 
     private func loadPersistedCells() {
@@ -483,4 +602,10 @@ enum ControllerMode: Hashable {
     case unknown
     case absolute
     case relative
+}
+
+private struct DispatchDebounceKey: Hashable {
+    let cellIndex: Int
+    let sourceID: Int32
+    let trigger: MIDITrigger
 }

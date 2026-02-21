@@ -7,13 +7,20 @@
 
 import SwiftUI
 import Combine
+#if canImport(AppKit)
+import AppKit
+#endif
 
 struct ContentView: View {
-    @StateObject private var viewModel = AppViewModel()
+    @ObservedObject var viewModel: AppViewModel
     @State private var showOBSSettings = false
+    @State private var showDeleteLinkConfirmation = false
     @State private var obsHost = OBSConnectionSettings.default.host
     @State private var obsPort = String(OBSConnectionSettings.default.port)
     @State private var obsPassword = OBSConnectionSettings.default.password
+    #if canImport(AppKit)
+    @State private var localDeleteKeyMonitor: Any?
+    #endif
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -28,12 +35,11 @@ struct ContentView: View {
                 Button("OBS Test") {
                     viewModel.sendOBSDebugToggle()
                 }
-                Toggle("Learn", isOn: $viewModel.isLearnEnabled)
-                    .toggleStyle(.switch)
-                    .labelsHidden()
-                Text(viewModel.isLearnEnabled ? "Learn ON" : "Learn OFF")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Button(viewModel.isLearnEnabled ? "Learn ON" : "Learn OFF") {
+                    viewModel.setLearnEnabled(!viewModel.isLearnEnabled)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(viewModel.isLearnEnabled ? .green : .gray)
             }
 
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4), spacing: 10) {
@@ -42,6 +48,9 @@ struct ContentView: View {
                         cellState: viewModel.cells[index],
                         mappingTitle: viewModel.mappingTitle(for: index),
                         mappingTargetID: viewModel.mappingTargetID(for: index),
+                        previewEvent: (viewModel.isLearnEnabled && index == viewModel.selectedCellIndex) ? viewModel.learnPreviewEvent : nil,
+                        obsRecordingActive: viewModel.obsRecordingActive,
+                        obsMuteActive: viewModel.obsMuteState(for: viewModel.mappingTargetID(for: index)),
                         isSelected: index == viewModel.selectedCellIndex,
                         tileColor: tileColor(for: index),
                         isLearnEnabled: viewModel.isLearnEnabled
@@ -100,6 +109,32 @@ struct ContentView: View {
                 }
             )
         }
+        .onDeleteCommand {
+            guard viewModel.isLearnEnabled, viewModel.canRemoveLinkForSelectedCell else { return }
+            showDeleteLinkConfirmation = true
+        }
+        .confirmationDialog(
+            "Koppeling verwijderen?",
+            isPresented: $showDeleteLinkConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Verwijder koppeling", role: .destructive) {
+                viewModel.removeLinkForSelectedCell()
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(!viewModel.isLearnEnabled || !viewModel.canRemoveLinkForSelectedCell)
+            Button("Annuleren", role: .cancel) {}
+        } message: {
+            Text("De MIDI-trigger en target van de geselecteerde tegel worden verwijderd.")
+        }
+        #if canImport(AppKit)
+        .onAppear {
+            installDeleteKeyMonitorIfNeeded()
+        }
+        .onDisappear {
+            removeDeleteKeyMonitor()
+        }
+        #endif
     }
 
     private func tileColor(for index: Int) -> Color {
@@ -142,12 +177,38 @@ struct ContentView: View {
         )
         OBSSettingsStorage.save(settings)
     }
+
+    #if canImport(AppKit)
+    private func installDeleteKeyMonitorIfNeeded() {
+        guard localDeleteKeyMonitor == nil else { return }
+        localDeleteKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if NSApp.keyWindow?.firstResponder is NSTextView {
+                return event
+            }
+            let isDelete = event.keyCode == 51 || event.keyCode == 117
+            let noModifiers = event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty
+            guard isDelete, noModifiers else { return event }
+            guard viewModel.isLearnEnabled, viewModel.canRemoveLinkForSelectedCell else { return event }
+            showDeleteLinkConfirmation = true
+            return nil
+        }
+    }
+
+    private func removeDeleteKeyMonitor() {
+        guard let localDeleteKeyMonitor else { return }
+        NSEvent.removeMonitor(localDeleteKeyMonitor)
+        self.localDeleteKeyMonitor = nil
+    }
+    #endif
 }
 
 private struct EventCellView: View {
     let cellState: GridCellState
     let mappingTitle: String
     let mappingTargetID: String?
+    let previewEvent: MIDIEvent?
+    let obsRecordingActive: Bool
+    let obsMuteActive: Bool?
     let isSelected: Bool
     let tileColor: Color
     let isLearnEnabled: Bool
@@ -155,8 +216,6 @@ private struct EventCellView: View {
     @State private var pulseOpacity: Double = 0
     @State private var displayedRelativePhase: CGFloat = 0
     @State private var now = Date()
-    @State private var transportScale: CGFloat = 1
-    @State private var transportGlow: Double = 0
     @State private var hitTintOpacity: Double = 0
     @State private var hitBorderOpacity: Double = 0
     @State private var hitBorderWidth: CGFloat = 1.5
@@ -167,11 +226,11 @@ private struct EventCellView: View {
                 .fill(Color.gray.opacity(0.08))
 
             RoundedRectangle(cornerRadius: 10)
-                .fill(tileColor.opacity(hitTintOpacity))
+                .fill(animationColor.opacity(hitTintOpacity))
 
             GeometryReader { geo in
                 Rectangle()
-                    .fill(tileColor)
+                    .fill(animationColor)
                     .frame(height: geo.size.height * cellState.absoluteFill)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                     .opacity(cellState.controllerMode == .absolute ? (0.9 * activityOpacity) : 0)
@@ -179,7 +238,7 @@ private struct EventCellView: View {
             .clipShape(RoundedRectangle(cornerRadius: 10))
 
             Circle()
-                .fill(tileColor)
+                .fill(animationColor)
                 .scaleEffect(pulseScale)
                 .opacity(pulseOpacity)
                 .blur(radius: 0.8)
@@ -200,7 +259,7 @@ private struct EventCellView: View {
                         let radius = (CGFloat(idx) * period) + signedShift + (bandWidth * 0.5)
                         if radius > 0, radius < maxRadius {
                             Circle()
-                                .stroke(tileColor.opacity(0.55), lineWidth: bandWidth)
+                                .stroke(animationColor.opacity(0.55), lineWidth: bandWidth)
                                 .frame(width: radius * 2, height: radius * 2)
                         }
                     }
@@ -210,33 +269,31 @@ private struct EventCellView: View {
             }
             .clipShape(RoundedRectangle(cornerRadius: 10))
 
-            if let transportIcon {
-                TransportIconView(icon: transportIcon, color: tileColor)
-                    .scaleEffect(transportScale)
-                    .shadow(color: tileColor.opacity(transportGlow), radius: 16)
-            }
+            if hasVisibleContent {
+                centerFunctionIcon()
 
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .top) {
-                    Spacer()
-                    HStack(spacing: 6) {
-                        Image(systemName: cellState.event?.iconName ?? "square.dashed")
-                            .font(.title3.weight(.semibold))
-                        Text(cellState.event?.title ?? "-")
-                            .font(.title3.weight(.semibold))
-                            .lineLimit(1)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .top) {
+                        Spacer()
+                        HStack(spacing: 6) {
+                            Image(systemName: controllerIconName)
+                                .font(.title3.weight(.semibold))
+                            Text(controllerTitle)
+                                .font(.title3.weight(.semibold))
+                                .lineLimit(1)
+                        }
+                        .foregroundStyle(.primary.opacity(0.9))
                     }
-                    .foregroundStyle(.primary.opacity(0.9))
+                    Spacer()
+                    bottomInfoPanel
                 }
-                Spacer()
-                bottomInfoPanel
+                .padding(10)
             }
-            .padding(10)
         }
         .frame(maxWidth: .infinity, minHeight: 86, alignment: .topLeading)
         .overlay(
             RoundedRectangle(cornerRadius: 10)
-                .stroke(tileColor.opacity(hitBorderOpacity), lineWidth: hitBorderWidth)
+                .stroke(animationColor.opacity(hitBorderOpacity), lineWidth: hitBorderWidth)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10)
@@ -256,17 +313,6 @@ private struct EventCellView: View {
         .onChange(of: cellState.relativePhase) {
             withAnimation(.linear(duration: 0.16)) {
                 displayedRelativePhase = CGFloat(cellState.relativePhase)
-            }
-        }
-        .onChange(of: cellState.transportNonce) {
-            transportScale = 0.92
-            transportGlow = 0.65
-            withAnimation(.easeOut(duration: 0.22)) {
-                transportScale = 1.08
-            }
-            withAnimation(.easeOut(duration: 0.45)) {
-                transportScale = 1
-                transportGlow = 0
             }
         }
         .onChange(of: cellState.hitFeedbackNonce) {
@@ -305,28 +351,76 @@ private struct EventCellView: View {
         return max(0, 1 - ((age - 2) / 0.6))
     }
 
-    private var transportIcon: TransportIconKind? {
-        guard let event = cellState.event else { return nil }
-        if case let .mackieTransport(action) = event.kind {
-            switch action {
-            case .play:
-                return .pauseStop
-            case .stop:
-                return .system("stop.fill")
-            case .record:
-                return .system("record.circle.fill")
-            case .rewind:
-                return .system("backward.fill")
-            case .fastForward:
-                return .system("forward.fill")
-            }
+    private var hasVisibleContent: Bool {
+        if isLearnEnabled && isSelected {
+            return true
         }
-        return nil
+        return effectiveEvent != nil
+    }
+
+    private var effectiveEvent: MIDIEvent? {
+        previewEvent ?? cellState.event
+    }
+
+    private var isVolumeTarget: Bool {
+        mappingTargetID?.hasPrefix("input.volume.set.") == true
+    }
+
+    private var isAudioWidgetTarget: Bool {
+        guard let mappingTargetID else { return false }
+        return mappingTargetID.hasPrefix("input.volume.set.")
+            || mappingTargetID.hasPrefix("input.mute.toggle.")
+    }
+
+    private var controllerTitle: String {
+        if let event = effectiveEvent, let trigger = event.trigger {
+            return trigger.label
+        }
+        if let trigger = cellState.trigger {
+            return trigger.label
+        }
+        return "-"
+    }
+
+    private var controllerIconName: String {
+        if let event = effectiveEvent {
+            return event.iconName
+        }
+        guard let trigger = cellState.trigger else {
+            return "square.dashed"
+        }
+        switch trigger {
+        case .note:
+            return "pianokeys"
+        case .controlChange:
+            return "dial.medium"
+        case .programChange:
+            return "list.number"
+        case .pitchBend, .mackieVPot, .mackieFader:
+            return "slider.vertical.3"
+        case .mackieTransport:
+            return "button.horizontal.top.press.fill"
+        }
+    }
+
+    private var animationColor: Color {
+        guard isVolumeTarget else { return tileColor }
+        switch cellState.absoluteFill {
+        case ..<0.72:
+            return Color(red: 0.17, green: 0.72, blue: 0.23)
+        case ..<0.9:
+            return Color(red: 0.88, green: 0.67, blue: 0.05)
+        default:
+            return Color(red: 0.82, green: 0.18, blue: 0.18)
+        }
     }
 
     private var bottomInfoPanel: some View {
+        if mappingTitle.isEmpty {
+            return AnyView(EmptyView())
+        }
         let (pluginName, targetName) = parsedMappingTitle(mappingTitle)
-        return VStack(alignment: .leading, spacing: 2) {
+        return AnyView(VStack(alignment: .leading, spacing: 2) {
             Text(pluginName)
                 .font(.title3.weight(.medium))
                 .foregroundStyle(.primary.opacity(0.9))
@@ -351,6 +445,7 @@ private struct EventCellView: View {
             RoundedRectangle(cornerRadius: 10)
                 .stroke(Color.white.opacity(0.45), lineWidth: 1)
         }
+        )
     }
 
     private func parsedMappingTitle(_ value: String) -> (String, String) {
@@ -362,65 +457,104 @@ private struct EventCellView: View {
     }
 
     @ViewBuilder
+    private func centerFunctionIcon() -> some View {
+        if isLearnEnabled, let event = effectiveEvent {
+            switch event.kind {
+            case let .mackieTransport(action):
+                switch action {
+                case .record:
+                    Image(systemName: "record.circle.fill")
+                        .font(.system(size: 74, weight: .semibold))
+                        .foregroundStyle(.red.opacity(0.82))
+                case .stop:
+                    Image(systemName: "stop.fill")
+                        .font(.system(size: 62, weight: .bold))
+                        .foregroundStyle(animationColor.opacity(0.82))
+                case .play:
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 66, weight: .semibold))
+                        .foregroundStyle(animationColor.opacity(0.82))
+                case .rewind:
+                    Image(systemName: "backward.fill")
+                        .font(.system(size: 62, weight: .semibold))
+                        .foregroundStyle(animationColor.opacity(0.82))
+                case .fastForward:
+                    Image(systemName: "forward.fill")
+                        .font(.system(size: 62, weight: .semibold))
+                        .foregroundStyle(animationColor.opacity(0.82))
+                }
+            default:
+                EmptyView()
+            }
+        } else if let targetID = mappingTargetID, targetID.hasPrefix("input.volume.set.") {
+            Image(systemName: "speaker.wave.2.fill")
+                .font(.system(size: 74, weight: .semibold))
+                .foregroundStyle(animationColor.opacity(0.82))
+        } else if let targetID = mappingTargetID, targetID.hasPrefix("input.mute.toggle.") {
+            Image(systemName: (obsMuteActive ?? false) ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                .font(.system(size: 74, weight: .semibold))
+                .foregroundStyle(animationColor.opacity(0.82))
+        } else if let targetID = mappingTargetID, targetID.hasPrefix("scene.program.") {
+            Image(systemName: "rectangle.3.group.fill")
+                .font(.system(size: 70, weight: .semibold))
+                .foregroundStyle(animationColor.opacity(0.82))
+        } else {
+            switch mappingTargetID {
+            case "recording.start":
+                Image(systemName: "record.circle.fill")
+                    .font(.system(size: 74, weight: .semibold))
+                    .foregroundStyle(.red.opacity(0.82))
+            case "recording.stop":
+                Image(systemName: "stop.fill")
+                    .font(.system(size: 62, weight: .bold))
+                    .foregroundStyle(animationColor.opacity(0.82))
+            case "recording.toggle":
+                if obsRecordingActive {
+                    Image(systemName: "stop.fill")
+                        .font(.system(size: 62, weight: .bold))
+                        .foregroundStyle(.red.opacity(0.82))
+                } else {
+                    Image(systemName: "record.circle")
+                        .font(.system(size: 74, weight: .semibold))
+                        .foregroundStyle(.red.opacity(0.82))
+                }
+            default:
+                EmptyView()
+            }
+        }
+    }
+
+    @ViewBuilder
     private func targetIcon() -> some View {
-        switch mappingTargetID {
-        case "recording.start":
+        if let targetID = mappingTargetID, targetID.hasPrefix("input.volume.set.") {
+            Image(systemName: "speaker.wave.2.fill")
+                .font(.title3)
+                .foregroundStyle(.primary.opacity(0.9))
+        } else if let targetID = mappingTargetID, targetID.hasPrefix("input.mute.toggle.") {
+            Image(systemName: (obsMuteActive ?? false) ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                .font(.title3)
+                .foregroundStyle(.primary.opacity(0.85))
+        } else if let targetID = mappingTargetID, targetID.hasPrefix("scene.program.") {
+            Image(systemName: "rectangle.3.group.fill")
+                .font(.title3)
+                .foregroundStyle(.primary.opacity(0.85))
+        } else {
+            switch mappingTargetID {
+            case "recording.start":
             Image(systemName: "record.circle.fill")
                 .font(.title3)
                 .foregroundStyle(.red.opacity(0.9))
-        case "recording.stop":
+            case "recording.stop":
             Image(systemName: "stop.circle.fill")
                 .font(.title3)
                 .foregroundStyle(.primary.opacity(0.85))
-        case "recording.toggle":
-            HStack(spacing: 3) {
-                Image(systemName: "record.circle.fill")
-                    .foregroundStyle(.red.opacity(0.9))
-                Image(systemName: "arrow.triangle.2.circlepath")
-                    .foregroundStyle(.primary.opacity(0.85))
+            case "recording.toggle":
+            Image(systemName: obsRecordingActive ? "stop.circle.fill" : "record.circle")
+                .font(.title3)
+                .foregroundStyle(.red.opacity(0.9))
+            default:
+                EmptyView()
             }
-            .font(.caption.weight(.semibold))
-        default:
-            EmptyView()
-        }
-    }
-}
-
-private enum TransportIconKind {
-    case system(String)
-    case pauseStop
-}
-
-private struct TransportIconView: View {
-    let icon: TransportIconKind
-    let color: Color
-
-    var body: some View {
-        switch icon {
-        case let .system(name):
-            Image(systemName: name)
-                .font(.system(size: 56, weight: .semibold))
-                .foregroundStyle(color.opacity(0.9))
-        case .pauseStop:
-            HStack(spacing: 12) {
-                HStack(spacing: 4) {
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(color.opacity(0.9))
-                        .frame(width: 8, height: 28)
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(color.opacity(0.9))
-                        .frame(width: 8, height: 28)
-                }
-                RoundedRectangle(cornerRadius: 3)
-                    .fill(color.opacity(0.9))
-                    .frame(width: 22, height: 22)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(Color.white.opacity(0.2))
-            )
         }
     }
 }
@@ -461,6 +595,15 @@ private struct MappingEditorView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+        }
+        .onAppear {
+            viewModel.refreshTargetsForSelectedCell()
+        }
+        .onChange(of: viewModel.selectedCellIndex) {
+            viewModel.refreshTargetsForSelectedCell()
+        }
+        .onChange(of: viewModel.pluginIDForSelectedCell()) {
+            viewModel.refreshTargetsForSelectedCell()
         }
     }
 }

@@ -9,9 +9,20 @@ import SwiftUI
 
 @main
 struct MidiControllerApp: App {
+    @StateObject private var viewModel = AppViewModel()
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ContentView(viewModel: viewModel)
+        }
+        .commands {
+            CommandMenu("Koppeling") {
+                Button("Verwijder koppeling") {
+                    viewModel.removeLinkForSelectedCell()
+                }
+                .keyboardShortcut(.delete, modifiers: [])
+                .disabled(!viewModel.isLearnEnabled || !viewModel.canRemoveLinkForSelectedCell)
+            }
         }
     }
 }

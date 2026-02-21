@@ -198,9 +198,9 @@ enum MIDIMessageParser {
         let normalized = sourceName.lowercased()
         guard normalized.contains("arturia"), normalized.contains("daw") else { return nil }
         switch note {
-        case 95: return .stop
+        case 93: return .stop
         case 94: return .play
-        case 93: return .record
+        case 95: return .record
         default: return nil
         }
     }
