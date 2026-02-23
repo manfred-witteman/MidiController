@@ -410,6 +410,8 @@ private final class OBSWebSocketClient {
     private var inputVolumeCache: [String: Double] = [:]
     private var inputMuteStates: [String: Bool] = [:]
     private var ccModeTrackers: [String: CCModeTracker] = [:]
+    private var inFlightSceneItemRequests = Set<String>()
+    private var lastSceneItemRequestAt: [String: Date] = [:]
     private var isRecordingActive = false
     private var rpcVersion = 1
     private var didWarnAboutMissingPassword = false
@@ -1205,6 +1207,16 @@ private final class OBSWebSocketClient {
         } else {
             requestData = ["sceneName": sceneName]
         }
+        let requestKey = sceneItemRequestKey(sceneName: sceneName, sceneUUID: sceneUUID)
+        let now = Date()
+        if inFlightSceneItemRequests.contains(requestKey) {
+            return
+        }
+        if let last = lastSceneItemRequestAt[requestKey], now.timeIntervalSince(last) < 0.25 {
+            return
+        }
+        inFlightSceneItemRequests.insert(requestKey)
+        lastSceneItemRequestAt[requestKey] = now
         sendRequest(
             requestType: "GetSceneItemList",
             requestData: requestData,
@@ -1212,6 +1224,7 @@ private final class OBSWebSocketClient {
             quietSuccessLog: true
         ) { [weak self] responseData in
             guard let self else { return }
+            defer { self.inFlightSceneItemRequests.remove(requestKey) }
             let rawItems = (responseData["sceneItems"] as? [[String: Any]]) ?? []
             let rawNames = rawItems.compactMap { $0["sourceName"] as? String }
             let debugSceneID = sceneUUID ?? "no-uuid"
@@ -1258,6 +1271,13 @@ private final class OBSWebSocketClient {
             }
             OBSTargetCatalog.emitDidChange()
         }
+    }
+
+    private func sceneItemRequestKey(sceneName: String, sceneUUID: String?) -> String {
+        if let sceneUUID, !sceneUUID.isEmpty {
+            return "uuid:\(sceneUUID)"
+        }
+        return "name:\(sceneName.lowercased())"
     }
 
     private func updateSceneItemEnabled(sceneName: String, sceneItemID: Int, enabled: Bool) {

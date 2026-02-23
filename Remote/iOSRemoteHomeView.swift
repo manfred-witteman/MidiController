@@ -330,14 +330,6 @@ struct IOSRemoteHomeView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                LinearGradient(
-                    colors: [Color(red: 0.45, green: 0.50, blue: 0.63), Color(red: 0.28, green: 0.32, blue: 0.44)],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-                .overlay(Color.white.opacity(0.08))
-                .ignoresSafeArea()
-
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
                         Text(vm.sceneName)
@@ -370,9 +362,23 @@ struct IOSRemoteHomeView: View {
                     .padding(.horizontal)
                     .padding(.bottom, 120)
                 }
+                .background(
+                    ZStack {
+                        Image("RemoteBackground")
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .ignoresSafeArea()
+                        Color.clear
+                            .background(Material.regular)
+                            .opacity(0.28)
+                            .ignoresSafeArea()
+                    }
+                )
                 .overlay(alignment: .bottom) {
                     RemoteBottomBar(
                         isRecording: vm.recordingActive,
+                        isBackEnabled: true, // TODO: set to false when at first scene
+                        isNextEnabled: true, // TODO: set to false when at last scene
                         onBack: {
                             vm.system(.previousScene)
                         },
@@ -507,15 +513,17 @@ private struct RemoteLampButtonCard: View {
 
 private struct RemoteBottomBar: View {
     let isRecording: Bool
+    var isBackEnabled: Bool = true
+    var isNextEnabled: Bool = true
     let onBack: () -> Void
     let onRecord: () -> Void
     let onNext: () -> Void
 
     var body: some View {
         HStack {
-            barButton(icon: "backward.fill", label: "back", color: .white, action: onBack)
-            barButton(icon: "record.circle.fill", label: isRecording ? "stop" : "record", color: .red, action: onRecord)
-            barButton(icon: "forward.fill", label: "next", color: .white, action: onNext)
+            barButton(icon: "backward.fill", label: "back", color: .white, enabled: isBackEnabled, action: onBack)
+            barButton(icon: "record.circle.fill", label: isRecording ? "stop" : "record", color: .red, enabled: true, action: onRecord)
+            barButton(icon: "forward.fill", label: "next", color: .white, enabled: isNextEnabled, action: onNext)
         }
         .padding(.vertical, 12)
         .padding(.horizontal, 18)
@@ -523,7 +531,7 @@ private struct RemoteBottomBar: View {
     }
 
     @ViewBuilder
-    private func barButton(icon: String, label: String, color: Color, action: @escaping () -> Void) -> some View {
+    private func barButton(icon: String, label: String, color: Color, enabled: Bool = true, action: @escaping () -> Void) -> some View {
         Button(action: {
             // Use a slightly stronger feedback for record, light for others
             if icon == "record.circle.fill" {
@@ -545,6 +553,8 @@ private struct RemoteBottomBar: View {
             .frame(maxWidth: .infinity)
         }
         .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1.0 : 0.45)
     }
 }
 
@@ -621,3 +631,4 @@ private struct RemoteVerticalSlider: View {
     }
 }
 #endif
+
