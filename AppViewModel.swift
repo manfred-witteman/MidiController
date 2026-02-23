@@ -23,12 +23,37 @@ final class AppViewModel: ObservableObject {
     private let persistedCellsKey = "AppViewModel.persistedCells.v1"
     private var recentDispatches: [DispatchDebounceKey: Date] = [:]
     private let instanceID = String(UUID().uuidString.prefix(8))
+    private let serverStartedAt = Date()
+    private var autosaveCancellable: AnyCancellable?
+    private var remoteBridge: DesktopBonjourBridge?
+    private var remotePadActions: [Int: RemotePadAction] = [:]
 
     init() {
         isLearnEnabled = false
         self.availablePlugins = pluginRegistry.plugins.map { PluginDescriptor(id: $0.id, name: $0.name) }
         appendToLog("[DEBUG] AppViewModel init id=\(instanceID)")
         loadPersistedCells()
+        autosaveCancellable = $cells
+            .dropFirst()
+            .debounce(for: .milliseconds(150), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.savePersistedCells()
+            }
+        remoteBridge = DesktopBonjourBridge(
+            snapshotProvider: { [weak self] in
+                self?.buildRemoteSnapshot() ?? RemoteSnapshot(appName: "MIDI Controller", generatedAt: Date(), serverInstanceID: nil, serverStartedAt: nil, sceneName: nil, recordingActive: false, pads: [])
+            },
+            tapHandler: { [weak self] index in
+                self?.dispatchRemoteTap(on: index)
+            },
+            valueHandler: { [weak self] index, normalized in
+                self?.dispatchRemoteValue(on: index, normalized: normalized)
+            },
+            systemHandler: { [weak self] action in
+                self?.dispatchRemoteSystemAction(action)
+            }
+        )
+        remoteBridge?.start()
         midiService.onEvent = { [weak self] event in
             self?.handle(event: event)
         }
@@ -72,6 +97,7 @@ final class AppViewModel: ObservableObject {
     }
 
     deinit {
+        remoteBridge?.stop()
         print("[DEBUG] AppViewModel deinit id=\(instanceID)")
         if let observer = pluginLogObserver {
             NotificationCenter.default.removeObserver(observer)
@@ -137,6 +163,15 @@ final class AppViewModel: ObservableObject {
             return trigger.label
         }
         return "Nog geen MIDI trigger geleerd"
+    }
+
+    func selectCell(_ index: Int) {
+        guard cells.indices.contains(index) else { return }
+        if selectedCellIndex == index { return }
+        selectedCellIndex = index
+        if isLearnEnabled {
+            learnPreviewEvent = nil
+        }
     }
 
     func pluginIDForSelectedCell() -> String {
@@ -213,6 +248,219 @@ final class AppViewModel: ObservableObject {
         pluginRegistry.plugin(id: "obs")?.handle(event: event, targetID: "recording.toggle")
     }
 
+    private func buildRemoteSnapshot() -> RemoteSnapshot {
+        remotePadActions.removeAll()
+        let controls = OBSPlugin.remoteSceneControls()
+        let pads: [RemotePadModel] = controls.map { control in
+            let style: RemoteTriggerStyle = control.normalizedValue != nil ? .controlAbsolute : .note
+            if let sceneItemID = control.sceneItemID {
+                remotePadActions[control.id] = .sceneControl(sceneName: control.sceneName, sceneItemID: sceneItemID)
+            } else if let inputName = control.inputName {
+                remotePadActions[control.id] = .inputControl(inputName: inputName)
+            }
+            return RemotePadModel(
+                id: control.id,
+                title: control.sourceName,
+                triggerLabel: "",
+                triggerStyle: style,
+                targetTitle: control.sourceName,
+                hasMapping: true,
+                statusText: control.statusText,
+                normalizedValue: control.normalizedValue
+            )
+        }
+        return RemoteSnapshot(
+            appName: "MIDI Controller",
+            generatedAt: Date(),
+            serverInstanceID: instanceID,
+            serverStartedAt: serverStartedAt,
+            sceneName: OBSPlugin.currentSceneName(),
+            recordingActive: obsRecordingActive,
+            pads: pads
+        )
+    }
+
+    private func remoteTriggerStyle(for trigger: MIDITrigger?) -> RemoteTriggerStyle {
+        guard let trigger else { return .unknown }
+        switch trigger {
+        case .note:
+            return .note
+        case .controlChange:
+            return .controlAbsolute
+        case .programChange:
+            return .program
+        case .pitchBend, .mackieFader:
+            return .pitch
+        case .mackieTransport:
+            return .transport
+        case .mackieVPot:
+            return .controlRelative
+        }
+    }
+
+    private func dispatchRemoteTap(on index: Int) {
+        if let action = remotePadActions[index] {
+            switch action {
+            case let .sceneControl(sceneName, sceneItemID):
+                OBSPlugin.toggleSceneItem(sceneName: sceneName, sceneItemID: sceneItemID)
+            case let .inputControl(inputName):
+                OBSPlugin.toggleInputMuteDirect(inputName: inputName)
+            }
+            return
+        }
+        guard cells.indices.contains(index) else { return }
+        guard let trigger = cells[index].trigger else { return }
+        let event = syntheticEvent(for: trigger, sourceName: "iOS Remote", sourceID: -1000, normalized: nil)
+        cells[index].event = event
+        applyAnimation(to: index, event: event)
+        if let mapping = cells[index].mapping {
+            pluginRegistry.plugin(id: mapping.pluginID)?.handle(event: event, targetID: mapping.targetID)
+        }
+    }
+
+    private func dispatchRemoteValue(on index: Int, normalized: Double) {
+        if let action = remotePadActions[index] {
+            switch action {
+            case let .sceneControl(sceneName, sceneItemID):
+                OBSPlugin.setSceneItemLevel(sceneName: sceneName, sceneItemID: sceneItemID, normalized: normalized)
+            case let .inputControl(inputName):
+                OBSPlugin.setInputVolumeDirect(inputName: inputName, normalized: normalized)
+            }
+            return
+        }
+        guard cells.indices.contains(index) else { return }
+        guard let trigger = cells[index].trigger else { return }
+        let event = syntheticEvent(for: trigger, sourceName: "iOS Remote", sourceID: -1000, normalized: normalized)
+        cells[index].event = event
+        applyAnimation(to: index, event: event)
+        if let mapping = cells[index].mapping {
+            pluginRegistry.plugin(id: mapping.pluginID)?.handle(event: event, targetID: mapping.targetID)
+        }
+    }
+
+    private func dispatchRemoteSystemAction(_ action: RemoteSystemAction) {
+        switch action {
+        case .previousScene:
+            OBSPlugin.goToNextScene()
+        case .nextScene:
+            OBSPlugin.goToPreviousScene()
+        case .toggleRecording:
+            OBSPlugin.toggleRecording()
+        case .refresh:
+            OBSPlugin.refreshCatalog()
+        }
+    }
+
+    private func remoteStatus(for index: Int, cell: GridCellState) -> (text: String, normalized: Double?) {
+        if let targetID = mappingTargetID(for: index),
+           let muteState = obsMuteState(for: targetID) {
+            return (muteState ? "Uit" : "Aan", muteState ? 0.0 : 1.0)
+        }
+        guard let event = cell.event else {
+            return ("Tap", nil)
+        }
+        switch event.kind {
+        case let .controlChange(_, _, value):
+            let norm = max(0.0, min(1.0, Double(value) / 127.0))
+            return ("\(Int(norm * 100))%", norm)
+        case let .pitchBend(_, value):
+            let norm = max(0.0, min(1.0, Double(value) / 16383.0))
+            return ("\(Int(norm * 100))%", norm)
+        case let .mackieFader(_, value):
+            let norm = max(0.0, min(1.0, Double(value) / 16383.0))
+            return ("\(Int(norm * 100))%", norm)
+        case let .note(_, _, velocity, _):
+            let norm = max(0.0, min(1.0, Double(velocity) / 127.0))
+            return ("\(Int(norm * 100))%", norm)
+        default:
+            return ("Aan", 1.0)
+        }
+    }
+
+    private enum RemotePadAction {
+        case sceneControl(sceneName: String, sceneItemID: Int)
+        case inputControl(inputName: String)
+    }
+
+    private func syntheticEvent(for trigger: MIDITrigger, sourceName: String, sourceID: Int32, normalized: Double?) -> MIDIEvent {
+        switch trigger {
+        case let .note(channel, note):
+            let velocity = Int((normalized ?? 1.0) * 127.0)
+            return MIDIEvent(
+                sourceName: sourceName,
+                sourceID: sourceID,
+                protocolKind: .raw,
+                kind: .note(channel: channel, note: note, velocity: max(1, velocity), isOn: true),
+                rawMessage: RawMIDIMessage(status: UInt8(0x90 | (channel & 0x0F)), data1: UInt8(note & 0x7F), data2: UInt8(max(1, velocity) & 0x7F))
+            )
+        case let .controlChange(channel, controller):
+            let value = Int((normalized ?? 0.5) * 127.0)
+            return MIDIEvent(
+                sourceName: sourceName,
+                sourceID: sourceID,
+                protocolKind: .raw,
+                kind: .controlChange(channel: channel, controller: controller, value: max(0, min(127, value))),
+                rawMessage: RawMIDIMessage(status: UInt8(0xB0 | (channel & 0x0F)), data1: UInt8(controller & 0x7F), data2: UInt8(max(0, min(127, value))))
+            )
+        case let .programChange(channel, program):
+            return MIDIEvent(
+                sourceName: sourceName,
+                sourceID: sourceID,
+                protocolKind: .raw,
+                kind: .programChange(channel: channel, program: program),
+                rawMessage: RawMIDIMessage(status: UInt8(0xC0 | (channel & 0x0F)), data1: UInt8(program & 0x7F), data2: 0)
+            )
+        case let .pitchBend(channel):
+            let bend = Int((normalized ?? 0.5) * 16383.0)
+            let lsb = bend & 0x7F
+            let msb = (bend >> 7) & 0x7F
+            return MIDIEvent(
+                sourceName: sourceName,
+                sourceID: sourceID,
+                protocolKind: .raw,
+                kind: .pitchBend(channel: channel, value: bend),
+                rawMessage: RawMIDIMessage(status: UInt8(0xE0 | (channel & 0x0F)), data1: UInt8(lsb), data2: UInt8(msb))
+            )
+        case let .mackieTransport(action):
+            let note: Int
+            switch action {
+            case .rewind: note = 91
+            case .fastForward: note = 92
+            case .stop: note = 93
+            case .play: note = 94
+            case .record: note = 95
+            }
+            return MIDIEvent(
+                sourceName: sourceName,
+                sourceID: sourceID,
+                protocolKind: .mackieControl,
+                kind: .mackieTransport(action),
+                rawMessage: RawMIDIMessage(status: 0x90, data1: UInt8(note), data2: 0x7F)
+            )
+        case let .mackieVPot(index):
+            let value = normalized.map { $0 >= 0.5 ? 1 : 65 } ?? 1
+            return MIDIEvent(
+                sourceName: sourceName,
+                sourceID: sourceID,
+                protocolKind: .mackieControl,
+                kind: .mackieVPot(index: index, value: value),
+                rawMessage: RawMIDIMessage(status: 0xB0, data1: UInt8((index + 15) & 0x7F), data2: UInt8(value & 0x7F))
+            )
+        case let .mackieFader(index):
+            let fader = Int((normalized ?? 0.5) * 16383.0)
+            let channel = max(0, min(7, index - 1))
+            let lsb = fader & 0x7F
+            let msb = (fader >> 7) & 0x7F
+            return MIDIEvent(
+                sourceName: sourceName,
+                sourceID: sourceID,
+                protocolKind: .mackieControl,
+                kind: .mackieFader(index: index, value: fader),
+                rawMessage: RawMIDIMessage(status: UInt8(0xE0 | channel), data1: UInt8(lsb), data2: UInt8(msb))
+            )
+        }
+    }
+
     private func handle(event: MIDIEvent) {
         appendToLog(event.logLine)
         appendToLog("[DEBUG] State -> vm=\(instanceID) learn=\(isLearnEnabled) selectedCell=\(selectedCellIndex)")
@@ -241,11 +489,6 @@ final class AppViewModel: ObservableObject {
             appendToLog("[DEBUG] Learn preview applied -> cell=\(selectedCellIndex) trigger=\(trigger.label)")
             applyAnimation(to: selectedCellIndex, event: event)
 
-            if cells[selectedCellIndex].mapping == nil {
-                let targetID = preferredDefaultTargetID(for: event)
-                cells[selectedCellIndex].mapping = ControlMapping(pluginID: defaultPluginID, targetID: targetID)
-            }
-
             if previousTrigger != cells[selectedCellIndex].trigger
                 || previousSourceID != cells[selectedCellIndex].triggerSourceID
                 || previousSourceName != cells[selectedCellIndex].triggerSourceName
@@ -260,11 +503,13 @@ final class AppViewModel: ObservableObject {
         }
 
         if let trigger = event.trigger {
+            var matchedIndices: [Int] = []
             for index in cells.indices {
                 guard cells[index].trigger == trigger else { continue }
                 if !isSourceMatch(cell: cells[index], event: event) {
                     continue
                 }
+                matchedIndices.append(index)
                 cells[index].event = event
                 applyAnimation(to: index, event: event)
                 if let mapping = cells[index].mapping {
@@ -273,6 +518,7 @@ final class AppViewModel: ObservableObject {
                     }
                 }
             }
+            appendToLog("[DEBUG] Runtime match -> trigger=\(trigger.label) cells=\(matchedIndices)")
         }
     }
 
@@ -437,7 +683,21 @@ final class AppViewModel: ObservableObject {
             restored[index].triggerSourceName = entry.triggerSourceName
             restored[index].mapping = entry.mapping
         }
+        var removedLegacySceneMappings = false
+        for index in restored.indices {
+            guard let mapping = restored[index].mapping else { continue }
+            if mapping.pluginID == "obs",
+               mapping.targetID.hasPrefix("scene.program."),
+               !mapping.targetID.hasPrefix("scene.program.uuid.") {
+                restored[index].mapping = nil
+                removedLegacySceneMappings = true
+            }
+        }
         cells = restored
+        if removedLegacySceneMappings {
+            appendToLog("[DEBUG] Legacy OBS scene-name mappings removed; reselect scenes using UUID-based targets.")
+            savePersistedCells()
+        }
     }
 
     private func savePersistedCells() {

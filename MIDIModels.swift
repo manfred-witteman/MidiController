@@ -95,9 +95,12 @@ enum MIDIEventKind: Hashable {
 
     var iconName: String {
         switch self {
-        case .note:
-            return "pianokeys"
-        case .controlChange:
+        case let .note(channel, note, _, _):
+            return isLikelyDrumPadNote(channel: channel, note: note) ? "square.grid.3x3.fill" : "pianokeys"
+        case let .controlChange(_, controller, _):
+            if isLikelyDrumPadController(controller) {
+                return "square.grid.3x3.fill"
+            }
             return "dial.medium"
         case .programChange:
             return "list.number"
@@ -172,6 +175,18 @@ enum MIDIEventKind: Hashable {
         }
         return -(value & 0x3F)
     }
+}
+
+private func isLikelyDrumPadController(_ controller: Int) -> Bool {
+    // Arturia pads commonly use CC 112...119.
+    (112...119).contains(controller)
+}
+
+private func isLikelyDrumPadNote(channel: Int, note: Int) -> Bool {
+    // MIDI channels are stored 0-based internally.
+    // Arturia pads are often on ch11, and in non-DAW mode can also appear as C2...G2.
+    if channel == 10 { return true }
+    return (36...43).contains(note)
 }
 
 private func midiNoteNameWithOctave(_ note: Int) -> String {

@@ -56,7 +56,7 @@ struct ContentView: View {
                         isLearnEnabled: viewModel.isLearnEnabled
                     )
                     .onTapGesture {
-                        viewModel.selectedCellIndex = index
+                        viewModel.selectCell(index)
                     }
                 }
             }
@@ -352,10 +352,7 @@ private struct EventCellView: View {
     }
 
     private var hasVisibleContent: Bool {
-        if isLearnEnabled && isSelected {
-            return true
-        }
-        return effectiveEvent != nil
+        return effectiveEvent != nil || cellState.trigger != nil || !mappingTitle.isEmpty
     }
 
     private var effectiveEvent: MIDIEvent? {
@@ -373,7 +370,7 @@ private struct EventCellView: View {
     }
 
     private var controllerTitle: String {
-        if let event = effectiveEvent, let trigger = event.trigger {
+        if isLearnEnabled, isSelected, let event = previewEvent, let trigger = event.trigger {
             return trigger.label
         }
         if let trigger = cellState.trigger {
@@ -383,15 +380,15 @@ private struct EventCellView: View {
     }
 
     private var controllerIconName: String {
-        if let event = effectiveEvent {
+        if isLearnEnabled, isSelected, let event = previewEvent {
             return event.iconName
         }
         guard let trigger = cellState.trigger else {
             return "square.dashed"
         }
         switch trigger {
-        case .note:
-            return "pianokeys"
+        case let .note(channel, note):
+            return isLikelyDrumPadNote(channel: channel, note: note) ? "square.grid.3x3.fill" : "pianokeys"
         case .controlChange:
             return "dial.medium"
         case .programChange:
@@ -416,6 +413,9 @@ private struct EventCellView: View {
     }
 
     private var bottomInfoPanel: some View {
+        if isLearnEnabled {
+            return AnyView(EmptyView())
+        }
         if mappingTitle.isEmpty {
             return AnyView(EmptyView())
         }
@@ -458,7 +458,7 @@ private struct EventCellView: View {
 
     @ViewBuilder
     private func centerFunctionIcon() -> some View {
-        if isLearnEnabled, let event = effectiveEvent {
+        if let event = effectiveEvent {
             switch event.kind {
             case let .mackieTransport(action):
                 switch action {
@@ -483,6 +483,26 @@ private struct EventCellView: View {
                         .font(.system(size: 62, weight: .semibold))
                         .foregroundStyle(animationColor.opacity(0.82))
                 }
+            case let .note(channel, note, _, _):
+                Image(systemName: isLikelyDrumPadNote(channel: channel, note: note) ? "square.grid.3x3.fill" : "pianokeys")
+                    .font(.system(size: 70, weight: .semibold))
+                    .foregroundStyle(animationColor.opacity(0.82))
+            case let .controlChange(_, controller, _):
+                Image(systemName: (112...119).contains(controller) ? "square.grid.3x3.fill" : "slider.vertical.3")
+                    .font(.system(size: 68, weight: .semibold))
+                    .foregroundStyle(animationColor.opacity(0.82))
+            case .mackieVPot, .pitchBend:
+                Image(systemName: "slider.vertical.3")
+                    .font(.system(size: 68, weight: .semibold))
+                    .foregroundStyle(animationColor.opacity(0.82))
+            case .mackieFader:
+                Image(systemName: "slider.vertical.3")
+                    .font(.system(size: 68, weight: .semibold))
+                    .foregroundStyle(animationColor.opacity(0.82))
+            case .programChange:
+                Image(systemName: "list.number")
+                    .font(.system(size: 64, weight: .semibold))
+                    .foregroundStyle(animationColor.opacity(0.82))
             default:
                 EmptyView()
             }
@@ -495,7 +515,7 @@ private struct EventCellView: View {
                 .font(.system(size: 74, weight: .semibold))
                 .foregroundStyle(animationColor.opacity(0.82))
         } else if let targetID = mappingTargetID, targetID.hasPrefix("scene.program.") {
-            Image(systemName: "rectangle.3.group.fill")
+            Image(systemName: "movieclapper.fill")
                 .font(.system(size: 70, weight: .semibold))
                 .foregroundStyle(animationColor.opacity(0.82))
         } else {
@@ -535,7 +555,7 @@ private struct EventCellView: View {
                 .font(.title3)
                 .foregroundStyle(.primary.opacity(0.85))
         } else if let targetID = mappingTargetID, targetID.hasPrefix("scene.program.") {
-            Image(systemName: "rectangle.3.group.fill")
+            Image(systemName: "movieclapper.fill")
                 .font(.title3)
                 .foregroundStyle(.primary.opacity(0.85))
         } else {
@@ -557,6 +577,11 @@ private struct EventCellView: View {
             }
         }
     }
+}
+
+private func isLikelyDrumPadNote(channel: Int, note: Int) -> Bool {
+    if channel == 10 { return true } // user-facing ch11
+    return (36...43).contains(note)  // C2...G2
 }
 
 private struct MappingEditorView: View {

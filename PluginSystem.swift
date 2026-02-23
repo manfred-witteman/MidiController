@@ -204,9 +204,57 @@ struct OBSPlugin: ControllerPlugin, DynamicTargetPlugin {
         if targetID == "recording.start" { return "Start Recording" }
         if targetID == "recording.stop" { return "Stop Recording" }
         if let route = OBSDynamicRoute(targetID: targetID) {
+            if case let .setProgramScene(sceneName, sceneUUID) = route {
+                if !sceneName.isEmpty {
+                    return sceneName
+                }
+                if let resolved = OBSWebSocketClient.shared.sceneName(forUUID: sceneUUID) {
+                    return resolved
+                }
+            }
             return route.displayName
         }
         return nil
+    }
+
+    static func currentSceneName() -> String? {
+        OBSWebSocketClient.shared.currentProgramSceneName()
+    }
+
+    static func goToPreviousScene() {
+        OBSWebSocketClient.shared.stepProgramScene(direction: -1)
+    }
+
+    static func goToNextScene() {
+        OBSWebSocketClient.shared.stepProgramScene(direction: 1)
+    }
+
+    static func toggleRecording() {
+        OBSWebSocketClient.shared.send(command: .toggle)
+    }
+
+    static func refreshCatalog() {
+        OBSWebSocketClient.shared.refreshDynamicTargets()
+    }
+
+    static func remoteSceneControls() -> [OBSRemoteSceneControl] {
+        OBSWebSocketClient.shared.currentRemoteSceneControls()
+    }
+
+    static func toggleSceneItem(sceneName: String, sceneItemID: Int) {
+        OBSWebSocketClient.shared.toggleSceneItem(sceneName: sceneName, sceneItemID: sceneItemID)
+    }
+
+    static func setSceneItemLevel(sceneName: String, sceneItemID: Int, normalized: Double) {
+        OBSWebSocketClient.shared.setSceneItemLevel(sceneName: sceneName, sceneItemID: sceneItemID, normalized: normalized)
+    }
+
+    static func toggleInputMuteDirect(inputName: String) {
+        OBSWebSocketClient.shared.toggleInputMuteDirect(inputName: inputName)
+    }
+
+    static func setInputVolumeDirect(inputName: String, normalized: Double) {
+        OBSWebSocketClient.shared.setInputVolumeDirect(inputName: inputName, normalized: normalized)
     }
 }
 
@@ -250,7 +298,7 @@ private enum OBSRecordingCommand: String {
 }
 
 private enum OBSDynamicRoute {
-    case setProgramScene(String)
+    case setProgramScene(sceneName: String, sceneUUID: String)
     case toggleInputMute(String)
     case setInputVolume(String)
 
@@ -267,8 +315,11 @@ private enum OBSDynamicRoute {
 
     var displayName: String {
         switch self {
-        case let .setProgramScene(sceneName):
-            return "Scene: \(sceneName)"
+        case let .setProgramScene(sceneName, sceneUUID):
+            if !sceneName.isEmpty {
+                return sceneName
+            }
+            return sceneUUID
         case let .toggleInputMute(inputName):
             return "Mute: \(inputName)"
         case let .setInputVolume(inputName):
@@ -289,8 +340,8 @@ private enum OBSDynamicRoute {
 
     var targetID: String {
         switch self {
-        case let .setProgramScene(sceneName):
-            return "scene.program.\(Self.encode(sceneName))"
+        case let .setProgramScene(sceneName, sceneUUID):
+            return "scene.program.uuid.\(Self.encode(sceneUUID))"
         case let .toggleInputMute(inputName):
             return "input.mute.toggle.\(Self.encode(inputName))"
         case let .setInputVolume(inputName):
@@ -299,10 +350,10 @@ private enum OBSDynamicRoute {
     }
 
     init?(targetID: String) {
-        if targetID.hasPrefix("scene.program.") {
-            let encoded = String(targetID.dropFirst("scene.program.".count))
+        if targetID.hasPrefix("scene.program.uuid.") {
+            let encoded = String(targetID.dropFirst("scene.program.uuid.".count))
             guard let decoded = Self.decode(encoded) else { return nil }
-            self = .setProgramScene(decoded)
+            self = .setProgramScene(sceneName: "", sceneUUID: decoded)
             return
         }
         if targetID.hasPrefix("input.mute.toggle.") {
@@ -349,8 +400,13 @@ private final class OBSWebSocketClient {
     private var responseHandlers: [String: ([String: Any]) -> Void] = [:]
     private var requestDisplayNames: [String: String] = [:]
     private var quietSuccessRequests = Set<String>()
-    private var sceneNames: [String] = []
+    private var scenes: [OBSScene] = []
+    private var currentSceneItems: [OBSSceneItem] = []
+    private var sceneItemsBySceneKey: [String: [OBSSceneItem]] = [:]
+    private var currentProgramSceneUUID: String?
+    private var currentProgramSceneNameCache: String?
     private var inputNames: [String] = []
+    private var inputDescriptors: [OBSInputDescriptor] = []
     private var inputVolumeCache: [String: Double] = [:]
     private var inputMuteStates: [String: Bool] = [:]
     private var ccModeTrackers: [String: CCModeTracker] = [:]
@@ -378,13 +434,13 @@ private final class OBSWebSocketClient {
     func currentTargetGroups() -> [PluginTargetGroup] {
         queue.sync {
             var groups = OBSPlugin.baseTargetGroups
-            if !sceneNames.isEmpty {
+            if !scenes.isEmpty {
                 groups.append(
                     PluginTargetGroup(
                         id: "scenes",
                         title: "Scenes",
-                        targets: sceneNames.map { name in
-                            PluginTarget(id: OBSDynamicRoute.setProgramScene(name).targetID, name: "Scene: \(name)")
+                        targets: scenes.map { scene in
+                            PluginTarget(id: OBSDynamicRoute.setProgramScene(sceneName: scene.name, sceneUUID: scene.uuid).targetID, name: scene.name)
                         }
                     )
                 )
@@ -419,6 +475,281 @@ private final class OBSWebSocketClient {
             guard self.isIdentified else { return }
             self.requestSceneList()
             self.requestInputList()
+        }
+    }
+
+    func sceneName(forUUID uuid: String) -> String? {
+        queue.sync {
+            scenes.first(where: { $0.uuid == uuid })?.name
+        }
+    }
+
+    func currentProgramSceneName() -> String? {
+        queue.sync {
+            if let uuid = currentProgramSceneUUID,
+               let scene = scenes.first(where: { $0.uuid == uuid }) {
+                return scene.name
+            }
+            return currentProgramSceneNameCache
+        }
+    }
+
+    func currentRemoteSceneControls() -> [OBSRemoteSceneControl] {
+        queue.sync {
+            let activeSceneName = currentProgramSceneNameCache ?? currentSceneItems.first?.sceneName
+            let activeSceneKey = cacheKey(sceneName: activeSceneName, sceneUUID: currentProgramSceneUUID)
+            let sceneItems: [OBSSceneItem]
+            if let cachedItems = sceneItemsBySceneKey[activeSceneKey], !cachedItems.isEmpty {
+                sceneItems = cachedItems
+            } else {
+                sceneItems = currentSceneItems
+            }
+            let sceneScopedItems: [OBSSceneItem]
+            if let activeSceneName {
+                sceneScopedItems = sceneItems.filter { $0.sceneName == activeSceneName }
+            } else {
+                sceneScopedItems = sceneItems
+            }
+            let descriptorIndex = Dictionary(uniqueKeysWithValues: inputDescriptors.enumerated().map { ($1.name, $0) })
+            var sortable: [(group: Int, order: Int, control: OBSRemoteSceneControl)] = sceneScopedItems.map { item in
+                let normalized: Double?
+                let statusText: String
+                if let inputName = item.inputName {
+                    let muted = inputMuteStates[inputName] ?? false
+                    let mul = inputVolumeCache[inputName] ?? 0
+                    let db = dbFromMul(mul)
+                    let value = clamp01((db + 60.0) / 60.0)
+                    normalized = value
+                    statusText = muted ? "Uit" : "\(Int(value * 100.0))%"
+                } else {
+                    normalized = item.sceneItemEnabled ? 1.0 : 0.0
+                    statusText = item.sceneItemEnabled ? "Aan" : "Uit"
+                }
+                let control = OBSRemoteSceneControl(
+                    id: item.sceneItemID,
+                    sceneItemID: item.sceneItemID,
+                    sceneName: item.sceneName,
+                    sourceName: item.sourceName,
+                    inputName: item.inputName,
+                    statusText: statusText,
+                    normalizedValue: normalized
+                )
+                let group = inputGroup(for: item.inputKind)
+                let order = item.inputName.flatMap { descriptorIndex[$0] } ?? (10_000 + item.sceneItemIndex)
+                return (group, order, control)
+            }
+
+            // Add global audio mixer channels (deduped against scene-linked inputs).
+            let linkedInputs = Set(sceneScopedItems.compactMap(\.inputName))
+            let audioInputs = inputDescriptors
+                .filter { inputGroup(for: $0.kind) == 0 }
+                .map(\.name)
+                .filter { !linkedInputs.contains($0) }
+            let sceneName = activeSceneName ?? "Current Scene"
+            for (offset, inputName) in audioInputs.enumerated() {
+                let muted = inputMuteStates[inputName] ?? false
+                let mul = inputVolumeCache[inputName] ?? 0
+                let db = dbFromMul(mul)
+                let value = clamp01((db + 60.0) / 60.0)
+                let control = OBSRemoteSceneControl(
+                    id: 200_000 + offset,
+                    sceneItemID: nil,
+                    sceneName: sceneName,
+                    sourceName: inputName,
+                    inputName: inputName,
+                    statusText: muted ? "Uit" : "\(Int(value * 100.0))%",
+                    normalizedValue: value
+                )
+                let order = descriptorIndex[inputName] ?? (30_000 + offset)
+                sortable.append((0, order, control))
+            }
+
+            return sortable
+                .sorted {
+                    if $0.group != $1.group { return $0.group < $1.group }
+                    if $0.order != $1.order { return $0.order < $1.order }
+                    return $0.control.sourceName.localizedCaseInsensitiveCompare($1.control.sourceName) == .orderedAscending
+                }
+                .map(\.control)
+        }
+    }
+
+    func stepProgramScene(direction: Int) {
+        queue.async {
+            self.ensureConnected()
+            guard self.isIdentified else { return }
+            guard !self.scenes.isEmpty else {
+                self.requestSceneList()
+                return
+            }
+            let currentIndex: Int
+            if let uuid = self.currentProgramSceneUUID,
+               let idx = self.scenes.firstIndex(where: { $0.uuid == uuid }) {
+                currentIndex = idx
+            } else {
+                currentIndex = 0
+            }
+            let nextIndex = max(0, min(self.scenes.count - 1, currentIndex + direction))
+            guard nextIndex != currentIndex || self.currentProgramSceneUUID == nil else { return }
+            let target = self.scenes[nextIndex]
+            self.currentProgramSceneUUID = target.uuid
+            self.currentProgramSceneNameCache = target.name
+            if let cached = self.sceneItemsBySceneKey[self.cacheKey(sceneName: target.name, sceneUUID: target.uuid)] {
+                self.currentSceneItems = cached
+            }
+            self.sendRequest(
+                requestType: "SetCurrentProgramScene",
+                requestData: ["sceneUuid": target.uuid, "sceneName": target.name],
+                displayName: "Set Scene",
+                quietSuccessLog: false,
+                responseHandler: { [weak self] _ in
+                    guard let self else { return }
+                    // Eagerly refresh items for the target scene so remote snapshots
+                    // do not lag behind while waiting for async OBS events.
+                    self.requestSceneItemList(sceneName: target.name, sceneUUID: target.uuid)
+                    self.requestSceneList()
+                }
+            )
+        }
+    }
+
+    func toggleSceneItem(sceneName: String, sceneItemID: Int) {
+        queue.async {
+            self.ensureConnected()
+            guard self.isIdentified else { return }
+            if let item = self.currentSceneItems.first(where: { $0.sceneName == sceneName && $0.sceneItemID == sceneItemID }),
+               let inputName = item.inputName {
+                let muted = !(self.inputMuteStates[inputName] ?? false)
+                self.setInputMuted(inputName: inputName, muted: muted)
+                self.sendRequest(
+                    requestType: "SetInputMute",
+                    requestData: [
+                        "inputName": inputName,
+                        "inputMuted": muted
+                    ],
+                    displayName: "Toggle Mute",
+                    quietSuccessLog: false,
+                    responseHandler: nil
+                )
+                return
+            }
+            let current = self.currentSceneItems.first(where: { $0.sceneName == sceneName && $0.sceneItemID == sceneItemID })?.sceneItemEnabled ?? false
+            let next = !current
+            self.updateSceneItemEnabled(sceneName: sceneName, sceneItemID: sceneItemID, enabled: next)
+            self.sendRequest(
+                requestType: "SetSceneItemEnabled",
+                requestData: [
+                    "sceneName": sceneName,
+                    "sceneItemId": sceneItemID,
+                    "sceneItemEnabled": next
+                ],
+                displayName: "Set Scene Item Enabled",
+                quietSuccessLog: false,
+                responseHandler: nil
+            )
+        }
+    }
+
+    func setSceneItemLevel(sceneName: String, sceneItemID: Int, normalized: Double) {
+        queue.async {
+            self.ensureConnected()
+            guard self.isIdentified else { return }
+            let clamped = self.clamp01(normalized)
+            if let inputName = self.currentSceneItems.first(where: { $0.sceneName == sceneName && $0.sceneItemID == sceneItemID })?.inputName {
+                let mul = self.volumeMulFromKnob(clamped)
+                self.inputVolumeCache[inputName] = mul
+                let enabled = clamped > 0.001
+                self.updateSceneItemEnabled(sceneName: sceneName, sceneItemID: sceneItemID, enabled: enabled)
+                let muted = !enabled
+                self.setInputMuted(inputName: inputName, muted: muted)
+                self.sendRequest(
+                    requestType: "SetInputVolume",
+                    requestData: [
+                        "inputName": inputName,
+                        "inputVolumeMul": mul
+                    ],
+                    displayName: "Set Volume",
+                    quietSuccessLog: false,
+                    responseHandler: nil
+                )
+                self.sendRequest(
+                    requestType: "SetInputMute",
+                    requestData: [
+                        "inputName": inputName,
+                        "inputMuted": muted
+                    ],
+                    displayName: "Set Mute",
+                    quietSuccessLog: true,
+                    responseHandler: nil
+                )
+                return
+            }
+
+            // Fallback for non-audio sources: map slider to enabled state.
+            let enabled = clamped > 0.01
+            self.updateSceneItemEnabled(sceneName: sceneName, sceneItemID: sceneItemID, enabled: enabled)
+            self.sendRequest(
+                requestType: "SetSceneItemEnabled",
+                requestData: [
+                    "sceneName": sceneName,
+                    "sceneItemId": sceneItemID,
+                    "sceneItemEnabled": enabled
+                ],
+                displayName: "Set Scene Item Enabled",
+                quietSuccessLog: false,
+                responseHandler: nil
+            )
+        }
+    }
+
+    func toggleInputMuteDirect(inputName: String) {
+        queue.async {
+            self.ensureConnected()
+            guard self.isIdentified else { return }
+            let muted = !(self.inputMuteStates[inputName] ?? false)
+            self.setInputMuted(inputName: inputName, muted: muted)
+            self.sendRequest(
+                requestType: "SetInputMute",
+                requestData: [
+                    "inputName": inputName,
+                    "inputMuted": muted
+                ],
+                displayName: "Toggle Mute",
+                quietSuccessLog: false,
+                responseHandler: nil
+            )
+        }
+    }
+
+    func setInputVolumeDirect(inputName: String, normalized: Double) {
+        queue.async {
+            self.ensureConnected()
+            guard self.isIdentified else { return }
+            let clamped = self.clamp01(normalized)
+            let mul = self.volumeMulFromKnob(clamped)
+            self.inputVolumeCache[inputName] = mul
+            let muted = clamped <= 0.001
+            self.setInputMuted(inputName: inputName, muted: muted)
+            self.sendRequest(
+                requestType: "SetInputVolume",
+                requestData: [
+                    "inputName": inputName,
+                    "inputVolumeMul": mul
+                ],
+                displayName: "Set Volume",
+                quietSuccessLog: false,
+                responseHandler: nil
+            )
+            self.sendRequest(
+                requestType: "SetInputMute",
+                requestData: [
+                    "inputName": inputName,
+                    "inputMuted": muted
+                ],
+                displayName: "Set Mute",
+                quietSuccessLog: true,
+                responseHandler: nil
+            )
         }
     }
 
@@ -519,7 +850,7 @@ private final class OBSWebSocketClient {
 
         var identifyData: [String: Any] = [
             "rpcVersion": rpcVersion,
-            "eventSubscriptions": 72
+            "eventSubscriptions": 76
         ]
 
         if let auth = d["authentication"] as? [String: Any] {
@@ -571,9 +902,9 @@ private final class OBSWebSocketClient {
         let requestType: String
         let requestData: [String: Any]
         switch route {
-        case let .setProgramScene(sceneName):
+        case let .setProgramScene(sceneName, sceneUUID):
             requestType = route.requestType
-            requestData = ["sceneName": sceneName]
+            requestData = ["sceneUuid": sceneUUID, "sceneName": sceneName]
         case let .toggleInputMute(inputName):
             requestType = "SetInputMute"
             let muted = resolveMutedStateForToggle(inputName: inputName, event: event)
@@ -665,8 +996,13 @@ private final class OBSWebSocketClient {
         task = nil
         isConnecting = false
         isIdentified = false
-        sceneNames = []
+        scenes = []
+        currentSceneItems = []
+        sceneItemsBySceneKey = [:]
+        currentProgramSceneUUID = nil
+        currentProgramSceneNameCache = nil
         inputNames = []
+        inputDescriptors = []
         inputVolumeCache.removeAll()
         inputMuteStates.removeAll()
         ccModeTrackers.removeAll()
@@ -714,9 +1050,21 @@ private final class OBSWebSocketClient {
             quietSuccessLog: true
         ) { [weak self] responseData in
             guard let self else { return }
-            let names = ((responseData["scenes"] as? [[String: Any]]) ?? [])
-                .compactMap { $0["sceneName"] as? String }
-            self.sceneNames = names
+            let listedScenes = ((responseData["scenes"] as? [[String: Any]]) ?? []).compactMap { raw -> OBSScene? in
+                guard let name = raw["sceneName"] as? String else { return nil }
+                let uuid = (raw["sceneUuid"] as? String) ?? ""
+                return OBSScene(name: name, uuid: uuid)
+            }
+            self.scenes = listedScenes
+            self.currentProgramSceneUUID = responseData["currentProgramSceneUuid"] as? String
+            self.currentProgramSceneNameCache = responseData["currentProgramSceneName"] as? String
+            if let sceneUUID = self.currentProgramSceneUUID,
+               let scene = listedScenes.first(where: { $0.uuid == sceneUUID }) {
+                self.requestSceneItemList(sceneName: scene.name, sceneUUID: scene.uuid)
+            } else if let sceneName = self.currentProgramSceneNameCache ?? listedScenes.first?.name {
+                let sceneUUID = listedScenes.first(where: { $0.name == sceneName })?.uuid
+                self.requestSceneItemList(sceneName: sceneName, sceneUUID: sceneUUID)
+            }
             OBSTargetCatalog.emitDidChange()
         }
     }
@@ -729,12 +1077,16 @@ private final class OBSWebSocketClient {
             quietSuccessLog: true
         ) { [weak self] responseData in
             guard let self else { return }
-            let names = ((responseData["inputs"] as? [[String: Any]]) ?? [])
-                .compactMap { $0["inputName"] as? String }
-                .sorted()
-            self.inputNames = names
-            for name in names {
-                self.requestInputMuteState(inputName: name)
+            let descriptors = ((responseData["inputs"] as? [[String: Any]]) ?? []).compactMap { raw -> OBSInputDescriptor? in
+                guard let name = raw["inputName"] as? String else { return nil }
+                let kind = (raw["unversionedInputKind"] as? String) ?? (raw["inputKind"] as? String) ?? ""
+                return OBSInputDescriptor(name: name, kind: kind)
+            }
+            self.inputDescriptors = descriptors
+            self.inputNames = descriptors.map(\.name)
+            for input in descriptors {
+                self.requestInputMuteState(inputName: input.name)
+                self.requestInputVolumeState(inputName: input.name)
             }
             OBSTargetCatalog.emitDidChange()
         }
@@ -755,6 +1107,10 @@ private final class OBSWebSocketClient {
 
     private func handleEvent(_ d: [String: Any]) {
         guard let eventType = d["eventType"] as? String else { return }
+        if isSceneCatalogEvent(eventType) {
+            requestSceneList()
+            return
+        }
         guard let eventData = d["eventData"] as? [String: Any] else { return }
         if eventType == "RecordStateChanged" {
             let active = (eventData["outputActive"] as? Bool) ?? false
@@ -765,6 +1121,43 @@ private final class OBSWebSocketClient {
             guard let inputName = eventData["inputName"] as? String else { return }
             let muted = (eventData["inputMuted"] as? Bool) ?? false
             setInputMuted(inputName: inputName, muted: muted)
+            return
+        }
+        if eventType == "InputVolumeChanged" {
+            guard let inputName = eventData["inputName"] as? String else { return }
+            if let mul = eventData["inputVolumeMul"] as? Double {
+                inputVolumeCache[inputName] = mul
+            } else if let db = eventData["inputVolumeDb"] as? Double {
+                inputVolumeCache[inputName] = mulFromDB(db)
+            }
+            return
+        }
+        if eventType == "CurrentProgramSceneChanged" {
+            currentProgramSceneNameCache = eventData["sceneName"] as? String
+            currentProgramSceneUUID = eventData["sceneUuid"] as? String
+            if let sceneName = currentProgramSceneNameCache {
+                requestSceneItemList(sceneName: sceneName, sceneUUID: currentProgramSceneUUID)
+            }
+            requestSceneList()
+            return
+        }
+        if eventType == "SceneItemEnableStateChanged" {
+            guard
+                let sceneName = eventData["sceneName"] as? String,
+                let sceneItemID = eventData["sceneItemId"] as? Int,
+                let enabled = eventData["sceneItemEnabled"] as? Bool
+            else { return }
+            updateSceneItemEnabled(sceneName: sceneName, sceneItemID: sceneItemID, enabled: enabled)
+            return
+        }
+    }
+
+    private func isSceneCatalogEvent(_ eventType: String) -> Bool {
+        switch eventType {
+        case "SceneNameChanged", "SceneCreated", "SceneRemoved", "SceneListChanged":
+            return true
+        default:
+            return false
         }
     }
 
@@ -786,6 +1179,104 @@ private final class OBSWebSocketClient {
             let muted = (responseData["inputMuted"] as? Bool) ?? false
             self.setInputMuted(inputName: inputName, muted: muted)
         }
+    }
+
+    private func requestInputVolumeState(inputName: String) {
+        sendRequest(
+            requestType: "GetInputVolume",
+            requestData: ["inputName": inputName],
+            displayName: "GetInputVolume",
+            quietSuccessLog: true
+        ) { [weak self] responseData in
+            guard let self else { return }
+            if let mul = responseData["inputVolumeMul"] as? Double {
+                self.inputVolumeCache[inputName] = mul
+            } else if let db = responseData["inputVolumeDb"] as? Double {
+                self.inputVolumeCache[inputName] = self.mulFromDB(db)
+            }
+        }
+    }
+
+    private func requestSceneItemList(sceneName: String, sceneUUID: String? = nil, allowNameFallback: Bool = true) {
+        let requestData: [String: Any]
+        if let sceneUUID, !sceneUUID.isEmpty {
+            // OBS API behaves more predictably when we pass one identifier only.
+            requestData = ["sceneUuid": sceneUUID]
+        } else {
+            requestData = ["sceneName": sceneName]
+        }
+        sendRequest(
+            requestType: "GetSceneItemList",
+            requestData: requestData,
+            displayName: "GetSceneItemList",
+            quietSuccessLog: true
+        ) { [weak self] responseData in
+            guard let self else { return }
+            let rawItems = (responseData["sceneItems"] as? [[String: Any]]) ?? []
+            let rawNames = rawItems.compactMap { $0["sourceName"] as? String }
+            let debugSceneID = sceneUUID ?? "no-uuid"
+            self.log("scene items response -> scene='\(sceneName)' uuid=\(debugSceneID) count=\(rawNames.count) names=\(rawNames.joined(separator: " | "))")
+            if rawItems.isEmpty, sceneUUID != nil, allowNameFallback {
+                self.log("scene items fallback -> retry by sceneName only for '\(sceneName)'")
+                self.requestSceneItemList(sceneName: sceneName, sceneUUID: nil, allowNameFallback: false)
+                return
+            }
+            let resolvedSceneName: String
+            if let sceneUUID,
+               let scene = self.scenes.first(where: { $0.uuid == sceneUUID }) {
+                resolvedSceneName = scene.name
+            } else {
+                resolvedSceneName = sceneName
+            }
+            let items = rawItems.enumerated().compactMap { (index, raw) -> OBSSceneItem? in
+                guard
+                    let sourceName = raw["sourceName"] as? String,
+                    let sceneItemID = raw["sceneItemId"] as? Int
+                else {
+                    return nil
+                }
+                let enabled = (raw["sceneItemEnabled"] as? Bool) ?? true
+                let inputName = self.inputNames.contains(sourceName) ? sourceName : nil
+                let inputKind = inputName.flatMap { name in
+                    self.inputDescriptors.first(where: { $0.name == name })?.kind
+                }
+                return OBSSceneItem(
+                    sceneName: resolvedSceneName,
+                    sceneItemID: sceneItemID,
+                    sceneItemIndex: index,
+                    sourceName: sourceName,
+                    sceneItemEnabled: enabled,
+                    inputName: inputName,
+                    inputKind: inputKind
+                )
+            }
+            let key = self.cacheKey(sceneName: resolvedSceneName, sceneUUID: sceneUUID)
+            self.sceneItemsBySceneKey[key] = items
+            let activeKey = self.cacheKey(sceneName: self.currentProgramSceneNameCache, sceneUUID: self.currentProgramSceneUUID)
+            if activeKey == key || (self.currentProgramSceneNameCache == nil && self.currentProgramSceneUUID == nil) {
+                self.currentSceneItems = items
+            }
+            OBSTargetCatalog.emitDidChange()
+        }
+    }
+
+    private func updateSceneItemEnabled(sceneName: String, sceneItemID: Int, enabled: Bool) {
+        if let index = currentSceneItems.firstIndex(where: { $0.sceneName == sceneName && $0.sceneItemID == sceneItemID }) {
+            currentSceneItems[index].sceneItemEnabled = enabled
+        }
+        for (key, var sceneItems) in sceneItemsBySceneKey {
+            if let index = sceneItems.firstIndex(where: { $0.sceneName == sceneName && $0.sceneItemID == sceneItemID }) {
+                sceneItems[index].sceneItemEnabled = enabled
+                sceneItemsBySceneKey[key] = sceneItems
+            }
+        }
+    }
+
+    private func cacheKey(sceneName: String?, sceneUUID: String?) -> String {
+        if let sceneUUID, !sceneUUID.isEmpty {
+            return "uuid:\(sceneUUID)"
+        }
+        return "name:\((sceneName ?? "unknown").lowercased())"
     }
 
     private func setInputMuted(inputName: String, muted: Bool) {
@@ -898,6 +1389,20 @@ private final class OBSWebSocketClient {
         max(-60, min(0, db))
     }
 
+    private func inputGroup(for kind: String?) -> Int {
+        let key = (kind ?? "").lowercased()
+        if key.contains("audio") || key.contains("wasapi") || key.contains("coreaudio") || key.contains("pulse") || key.contains("jack") || key.contains("asio") || key.contains("mic") {
+            return 0
+        }
+        if key.contains("camera") || key.contains("video") || key.contains("capture") {
+            return 1
+        }
+        if key.contains("image") || key.contains("slideshow") || key.contains("media") || key.contains("text") || key.contains("browser") {
+            return 2
+        }
+        return 3
+    }
+
     private func controlKey(for event: MIDIEvent) -> String {
         guard case let .controlChange(channel, controller, _) = event.kind else {
             return "\(event.sourceID):unknown"
@@ -930,6 +1435,36 @@ private final class OBSWebSocketClient {
         ccModeTrackers[key] = tracker
         return .absolute
     }
+}
+
+private struct OBSScene: Hashable {
+    let name: String
+    let uuid: String
+}
+
+struct OBSRemoteSceneControl: Hashable {
+    let id: Int
+    let sceneItemID: Int?
+    let sceneName: String
+    let sourceName: String
+    let inputName: String?
+    let statusText: String
+    let normalizedValue: Double?
+}
+
+private struct OBSSceneItem: Hashable {
+    let sceneName: String
+    let sceneItemID: Int
+    let sceneItemIndex: Int
+    let sourceName: String
+    var sceneItemEnabled: Bool
+    let inputName: String?
+    let inputKind: String?
+}
+
+private struct OBSInputDescriptor: Hashable {
+    let name: String
+    let kind: String
 }
 
 private enum CCInputMode {

@@ -112,6 +112,14 @@ enum MIDIMessageParser {
                 continue
             }
 
+            // Ignore SysEx/System messages for learn/mapping purposes.
+            if status >= 0xF0 {
+                // Do not scan forward here; some devices interleave packet fragments.
+                // Just skip the current status byte and continue parsing subsequent bytes.
+                index += 1
+                continue
+            }
+
             let messageType = status & 0xF0
             let channel = Int(status & 0x0F)
             let data1 = index + 1 < bytes.count ? bytes[index + 1] : 0
@@ -132,6 +140,10 @@ enum MIDIMessageParser {
                     kind = .note(channel: channel, note: Int(data1), velocity: velocity, isOn: isOn)
                 }
                 index += 3
+            case 0xA0:
+                // Ignore poly aftertouch for now.
+                index += 3
+                continue
             case 0xB0:
                 if looksLikeMackie, (16...23).contains(Int(data1)) {
                     kind = .mackieVPot(index: Int(data1) - 15, value: Int(data2))
@@ -142,6 +154,10 @@ enum MIDIMessageParser {
             case 0xC0:
                 kind = .programChange(channel: channel, program: Int(data1))
                 index += 2
+            case 0xD0:
+                // Ignore channel aftertouch for now.
+                index += 2
+                continue
             case 0xE0:
                 let bend = Int(data1) | (Int(data2) << 7)
                 if looksLikeMackie, channel < 8 {
