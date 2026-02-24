@@ -27,6 +27,8 @@ struct RemoteSnapshot: Codable {
     let serverInstanceID: String?
     let serverStartedAt: Date?
     let sceneName: String?
+    let scenes: [String]?
+    let currentSceneIndex: Int?
     let recordingActive: Bool
     let pads: [RemotePadModel]
 }

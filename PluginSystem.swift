@@ -241,6 +241,10 @@ struct OBSPlugin: ControllerPlugin, DynamicTargetPlugin {
         OBSWebSocketClient.shared.currentRemoteSceneControls()
     }
 
+    static func remoteSceneListState() -> (scenes: [String], currentIndex: Int?) {
+        OBSWebSocketClient.shared.remoteSceneListState()
+    }
+
     static func toggleSceneItem(sceneName: String, sceneItemID: Int) {
         OBSWebSocketClient.shared.toggleSceneItem(sceneName: sceneName, sceneItemID: sceneItemID)
     }
@@ -573,6 +577,24 @@ private final class OBSWebSocketClient {
                     return $0.control.sourceName.localizedCaseInsensitiveCompare($1.control.sourceName) == .orderedAscending
                 }
                 .map(\.control)
+        }
+    }
+
+    func remoteSceneListState() -> (scenes: [String], currentIndex: Int?) {
+        queue.sync {
+            let sceneNames = scenes.map(\.name)
+            guard !sceneNames.isEmpty else {
+                return ([], nil)
+            }
+            if let uuid = currentProgramSceneUUID,
+               let idx = scenes.firstIndex(where: { $0.uuid == uuid }) {
+                return (sceneNames, idx)
+            }
+            if let sceneName = currentProgramSceneNameCache,
+               let idx = scenes.firstIndex(where: { $0.name == sceneName }) {
+                return (sceneNames, idx)
+            }
+            return (sceneNames, nil)
         }
     }
 
@@ -1052,11 +1074,15 @@ private final class OBSWebSocketClient {
             quietSuccessLog: true
         ) { [weak self] responseData in
             guard let self else { return }
-            let listedScenes = ((responseData["scenes"] as? [[String: Any]]) ?? []).compactMap { raw -> OBSScene? in
+            let listedScenesRaw = ((responseData["scenes"] as? [[String: Any]]) ?? []).compactMap { raw -> OBSScene? in
                 guard let name = raw["sceneName"] as? String else { return nil }
                 let uuid = (raw["sceneUuid"] as? String) ?? ""
                 return OBSScene(name: name, uuid: uuid)
             }
+            // OBS often returns scenes in reverse of the navigation UX we want
+            // for remote back/next controls. Normalize once here so scene index
+            // and step direction are consistent everywhere.
+            let listedScenes = Array(listedScenesRaw.reversed())
             self.scenes = listedScenes
             self.currentProgramSceneUUID = responseData["currentProgramSceneUuid"] as? String
             self.currentProgramSceneNameCache = responseData["currentProgramSceneName"] as? String

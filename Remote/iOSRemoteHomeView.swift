@@ -10,6 +10,8 @@ final class IOSRemoteViewModel: ObservableObject {
     @Published var connectionLabel: String = "Zoeken..."
     @Published var sceneName: String = "Scene"
     @Published var recordingActive: Bool = false
+    @Published var canGoBack: Bool = true
+    @Published var canGoNext: Bool = true
 
     // Caching and refresh control
     private var snapshotCache: [String: [RemotePadModel]] = [:]
@@ -125,6 +127,7 @@ final class IOSRemoteViewModel: ObservableObject {
                 let newScene = snapshot.sceneName ?? self.sceneName
                 self.sceneName = newScene
                 self.recordingActive = snapshot.recordingActive
+                self.updateNavigationAvailability(scenes: snapshot.scenes, currentSceneIndex: snapshot.currentSceneIndex)
                 self.debug("snapshot received scene=\(newScene) pads=\(snapshot.pads.count) recording=\(snapshot.recordingActive)")
                 if !snapshot.pads.isEmpty {
                     let names = snapshot.pads.map(\.targetTitle).joined(separator: " | ")
@@ -158,6 +161,16 @@ final class IOSRemoteViewModel: ObservableObject {
                 self.debug("snapshot request returned non-snapshot response")
             }
         }
+    }
+
+    private func updateNavigationAvailability(scenes: [String]?, currentSceneIndex: Int?) {
+        guard let scenes, !scenes.isEmpty, let currentSceneIndex else {
+            canGoBack = true
+            canGoNext = true
+            return
+        }
+        canGoBack = currentSceneIndex > 0
+        canGoNext = currentSceneIndex < scenes.count - 1
     }
 
     func applyCachedIfAvailable(for scene: String) {
@@ -377,8 +390,8 @@ struct IOSRemoteHomeView: View {
                 .overlay(alignment: .bottom) {
                     RemoteBottomBar(
                         isRecording: vm.recordingActive,
-                        isBackEnabled: true, // TODO: set to false when at first scene
-                        isNextEnabled: true, // TODO: set to false when at last scene
+                        isBackEnabled: vm.canGoBack,
+                        isNextEnabled: vm.canGoNext,
                         onBack: {
                             vm.system(.previousScene)
                         },
@@ -631,4 +644,3 @@ private struct RemoteVerticalSlider: View {
     }
 }
 #endif
-

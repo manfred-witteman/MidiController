@@ -31,7 +31,8 @@ public struct RemoteBackgroundView: View {
                 .modifier(Scaled(mode: contentMode))
                 .clipped()
             if let overlay {
-                Rectangle().fill(overlay)
+                Rectangle()
+                    .fill(overlay)
             }
         }
         .ignoresSafeArea()
@@ -74,14 +75,14 @@ public extension View {
         _ imageName: String,
         contentMode: RemoteBackgroundView.ContentMode = .fill,
         placeholder: Color = .clear,
-        overlay: AnyShapeStyle
+        overlay: (any ShapeStyle)
     ) -> some View {
         self.background(
             RemoteBackgroundView(
                 imageName: imageName,
                 contentMode: contentMode,
                 placeholder: placeholder,
-                overlay: overlay
+                overlay: AnyShapeStyle(overlay)
             )
         )
     }

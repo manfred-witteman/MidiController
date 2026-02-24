@@ -41,7 +41,7 @@ final class AppViewModel: ObservableObject {
             }
         remoteBridge = DesktopBonjourBridge(
             snapshotProvider: { [weak self] in
-                self?.buildRemoteSnapshot() ?? RemoteSnapshot(appName: "MIDI Controller", generatedAt: Date(), serverInstanceID: nil, serverStartedAt: nil, sceneName: nil, recordingActive: false, pads: [])
+                self?.buildRemoteSnapshot() ?? RemoteSnapshot(appName: "MIDI Controller", generatedAt: Date(), serverInstanceID: nil, serverStartedAt: nil, sceneName: nil, scenes: nil, currentSceneIndex: nil, recordingActive: false, pads: [])
             },
             tapHandler: { [weak self] index in
                 self?.dispatchRemoteTap(on: index)
@@ -251,6 +251,7 @@ final class AppViewModel: ObservableObject {
     private func buildRemoteSnapshot() -> RemoteSnapshot {
         remotePadActions.removeAll()
         let controls = OBSPlugin.remoteSceneControls()
+        let sceneState = OBSPlugin.remoteSceneListState()
         let pads: [RemotePadModel] = controls.map { control in
             let style: RemoteTriggerStyle = control.normalizedValue != nil ? .controlAbsolute : .note
             if let sceneItemID = control.sceneItemID {
@@ -275,6 +276,8 @@ final class AppViewModel: ObservableObject {
             serverInstanceID: instanceID,
             serverStartedAt: serverStartedAt,
             sceneName: OBSPlugin.currentSceneName(),
+            scenes: sceneState.scenes,
+            currentSceneIndex: sceneState.currentIndex,
             recordingActive: obsRecordingActive,
             pads: pads
         )
@@ -341,9 +344,9 @@ final class AppViewModel: ObservableObject {
     private func dispatchRemoteSystemAction(_ action: RemoteSystemAction) {
         switch action {
         case .previousScene:
-            OBSPlugin.goToNextScene()
-        case .nextScene:
             OBSPlugin.goToPreviousScene()
+        case .nextScene:
+            OBSPlugin.goToNextScene()
         case .toggleRecording:
             OBSPlugin.toggleRecording()
         case .refresh:
